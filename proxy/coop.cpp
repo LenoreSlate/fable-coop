@@ -165,6 +165,8 @@ static void sample_at(const std::deque<PuppetSample> &s, double t, float out[5])
 }
 
 static bool safe_call(void *fn, DWORD self, const DWORD *args, int n, DWORD *ret);
+static bool block_achievements();
+static void watch_scripts();
 static void *game_va(ULONG_PTR ghidraVa);
 
 static bool place_puppet(float *phys, const float v[5])
@@ -187,6 +189,7 @@ static void __fastcall hk_MainUpdate(void *self, void *edx)
 {
     real_MainUpdate(self, edx);
     InterlockedIncrement(&g_frames);
+    watch_scripts();
     std::unique_lock<std::mutex> lk(g_jobsLock);
     Puppet &pp = g_puppetCtl;
     net_tick(pp);
@@ -544,6 +547,38 @@ static ISteamNetworking005 *steam_net()
     return g_steamNet;
 }
 
+// Test profiles (any but the kit's "coop") never send achievements or stats to Steam: saves from the internet
+// and quests completed by tools would unlock them on the owner's account for good. ISteamUserStats011 slots
+// (MSVC keeps the two overloaded GetStat / SetStat pairs together): 7 SetAchievement(name), 10 StoreStats().
+static bool __fastcall hk_SetAchievement(void *, void *, const char *name)  // fastcall pops the one stack arg like thiscall
+{
+    coop_log("achievement %s blocked (test profile)", name ? name : "?");
+    return true;
+}
+static bool __fastcall hk_StoreStats(void *, void *) { return true; }
+
+static bool block_achievements()
+{
+    static bool done;
+    if (done) return true;
+    char prof[64] = "";
+    GetEnvironmentVariableA("FABLE_COOP_PROFILE", prof, sizeof prof);
+    HMODULE api = GetModuleHandleA("steam_api.dll");
+    auto stats = api ? (void **(__cdecl *)())GetProcAddress(api, "SteamUserStats") : nullptr;
+    void **obj = stats ? stats() : nullptr;
+    if (!strcmp(prof, "coop")) return done = true;
+    if (!obj) return false;  // Steam not up yet
+    void **vt = (void **)*obj;
+    DWORD old;
+    VirtualProtect(vt + 7, 4 * sizeof(void *), PAGE_READWRITE, &old);
+    vt[7] = (void *)hk_SetAchievement;
+    vt[10] = (void *)hk_StoreStats;
+    VirtualProtect(vt + 7, 4 * sizeof(void *), old, &old);
+    done = true;
+    coop_log("Steam achievements and stats blocked for test profile %s", prof);
+    return true;
+}
+
 static bool net_on() { return g_sock != INVALID_SOCKET || g_peerSteam; }
 
 static void net_send(const NetPos &m)
@@ -865,6 +900,179 @@ static void start_bridge()
 typedef HRESULT(WINAPI *DI8Create)(HINSTANCE, DWORD, REFIID, LPVOID *, LPUNKNOWN);
 
 // Exported undecorated via /EXPORT in build.bat.
+// ---- test only: trace calls into CGameScriptInterface (FABLE_COOP_TRACE_GSI=1) ----
+// Quest scripts reach the game through this 942-slot interface. Every slot gets a 10-byte trampoline
+// (push slot; jmp gsi_trace_common) that logs the call and goes on to the original, leaving registers and
+// stack as they were, so any calling convention passes through. The first 40 calls per slot are logged with
+// the caller (Ghidra VA) and the first stack arguments, read as text when they are a CCharString (ptr -> +4 char *).
+static const ULONG_PTR kGsiVftable = 0x2ee35c4;
+static const int kGsiSlots = 942;
+static void *g_gsiOrig[kGsiSlots];
+static LONG g_gsiCalls[kGsiSlots];
+
+static void arg_text(DWORD a, char *out, size_t n)
+{
+    DWORD s, t;
+    char buf[48] = "";
+    out[0] = 0;
+    if (safe_copy(&s, (void *)a, 4) && s > 0x10000 && safe_copy(&t, (void *)(s + 4), 4) && t > 0x10000 &&
+        safe_copy(buf, (void *)t, sizeof buf - 1)) {
+        size_t i = 0;
+        while (buf[i] >= 0x20 && buf[i] < 0x7f) i++;
+        if (i >= 3 && !buf[i]) sprintf_s(out, n, " \"%s\"", buf);
+    }
+}
+
+static void __stdcall gsi_trace(int slot, DWORD *stack)  // stack[0] = return address, then the arguments
+{
+    LONG n = InterlockedIncrement(&g_gsiCalls[slot]);
+    if (n > 40) return;
+    DWORD a[3] = {};
+    safe_copy(a, stack + 1, sizeof a);
+    char t0[64], t1[64];
+    arg_text(a[0], t0, sizeof t0);
+    arg_text(a[1], t1, sizeof t1);
+    coop_log("gsi 0x%03x #%ld from %08lx (%08lx%s, %08lx%s, %08lx)", slot * 4, n,
+             (unsigned long)(stack[0] - (DWORD)g_exeBase + kGhidraBase), a[0], t0, a[1], t1, a[2]);
+}
+
+static __declspec(naked) void gsi_trace_common()
+{
+    __asm {
+        pushfd
+        pushad              ; esp: regs(32) flags(4) slot(4) ret ...
+        lea eax, [esp + 40]
+        push eax
+        push dword ptr [esp + 40]   ; slot (esp moved by 4)
+        call gsi_trace
+        popad
+        popfd
+        push eax
+        mov eax, [esp + 4]          ; slot
+        mov eax, g_gsiOrig[eax * 4]
+        mov [esp + 4], eax          ; the slot's stack cell now holds the original method
+        pop eax
+        ret                         ; into the original, stack as the caller left it
+    }
+}
+
+static void trace_gsi_init()
+{
+    BYTE *tramp = (BYTE *)VirtualAlloc(NULL, kGsiSlots * 10, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!tramp) return;
+    for (int i = 0; i < kGsiSlots; i++) {
+        BYTE *t = tramp + i * 10;
+        t[0] = 0x68;
+        *(DWORD *)(t + 1) = i;
+        t[5] = 0xe9;
+        *(DWORD *)(t + 6) = (DWORD)gsi_trace_common - (DWORD)(t + 10);
+        hook_vftable_slot(kGsiVftable, i, t, &g_gsiOrig[i]);
+    }
+    coop_log("GSI trace on (%d slots)", kGsiSlots);
+}
+
+// ---- quest success markers, learnt on the completing side ----
+// A quest script's ending coroutine waits for a byte of its own script object (success, e.g. +0x5c) and then calls
+// GSI 0x4bc. The co-op peer finishes the quest by setting that byte, which differs per script. Every frame the first
+// 0x100 bytes of each running script object are kept with the time each byte went from 0 to 1; when 0x4bc fires, the
+// bytes that went 0 -> 1 in the last 60 s are logged and the newest one per script appended to quest_markers.txt.
+static const ULONG_PTR kQuestManager = 0x3630360;
+static const int kGsiSetCompleted = 0x4bc / 4;
+struct ScriptWatch { std::string name; BYTE b[0x100]; double flip[0x100]; bool seen; };
+static std::map<DWORD, ScriptWatch> g_scripts;  // script object -> watch
+static std::mutex g_scriptsLock;
+
+static std::string cstring_text(DWORD cs)  // CCharString * -> text
+{
+    DWORD pn[2] = {};
+    char buf[128] = "";
+    if (cs && safe_copy(pn, (void *)(cs + 4), 8) && pn[0] && pn[1] < sizeof buf && safe_copy(buf, (void *)pn[0], pn[1]))
+        return std::string(buf, pn[1]);
+    return "";
+}
+
+static void watch_scripts()
+{
+    DWORD qm, head, node;
+    if (!safe_copy(&qm, game_va(kQuestManager), 4) || !qm || !safe_copy(&head, (void *)(qm + 0x44), 4) ||
+        !safe_copy(&node, (void *)head, 4))
+        return;
+    std::lock_guard<std::mutex> lk(g_scriptsLock);
+    for (auto &s : g_scripts) s.second.seen = false;
+    double t = now_s();
+    for (int n = 0; node != head && n < 300; n++) {
+        DWORD entry, obj, name, cur = node;
+        BYTE b[0x100];
+        if (!safe_copy(&node, (void *)cur, 4)) break;
+        // entries of finished scripts stay listed with no object
+        if (!safe_copy(&entry, (void *)(cur + 8), 4) || !safe_copy(&obj, (void *)(entry + 8), 4) ||
+            !safe_copy(&name, (void *)(entry + 0x34), 4) || !obj || !safe_copy(b, (void *)obj, sizeof b))
+            continue;
+        auto it = g_scripts.find(obj);
+        if (it == g_scripts.end()) {
+            ScriptWatch &w = g_scripts[obj];
+            w.name = cstring_text(name);
+            memcpy(w.b, b, sizeof b);
+            for (double &f : w.flip) f = -1;
+            w.seen = true;
+        } else {
+            ScriptWatch &w = it->second;
+            for (int i = 0; i < 0x100; i++)
+                if (!w.b[i] && b[i] == 1) w.flip[i] = t;
+            memcpy(w.b, b, sizeof b);
+            w.seen = true;
+        }
+    }
+    for (auto it = g_scripts.begin(); it != g_scripts.end();)
+        it = it->second.seen ? std::next(it) : g_scripts.erase(it);
+}
+
+static DWORD(__fastcall *real_SetCompleted)(void *, void *, DWORD, DWORD, DWORD, DWORD);
+static DWORD __fastcall hk_SetCompleted(void *gsi, void *edx, DWORD quest, DWORD screen, DWORD a2, DWORD a3)
+{
+    DWORD cs = 0;
+    safe_copy(&cs, (void *)quest, 4);  // the argument points at the CCharString, which holds the string object
+    std::string q = cstring_text(cs);
+    // The wait loop sits shortly before the call: list its `cmp byte ptr [reg+disp8], 0` (80 78..7f disp 00).
+    BYTE code[0x200], *ret = (BYTE *)_ReturnAddress();
+    char loop[128] = "";
+    if (safe_copy(code, ret - sizeof code, sizeof code))
+        for (int i = 0, len = 0; i + 3 < (int)sizeof code; i++)
+            if (code[i] == 0x80 && code[i + 1] >= 0x78 && code[i + 1] <= 0x7f && !code[i + 3] && len < 100)
+                len += sprintf_s(loop + len, sizeof loop - len, " +0x%02x", code[i + 2]);
+    coop_log("SetQuestAsCompleted %s from %08lx, %u scripts watched, byte tests before the call:%s", q.c_str(),
+             (unsigned long)((DWORD)ret - (DWORD)g_exeBase + kGhidraBase), (unsigned)g_scripts.size(), loop);
+    {
+        std::lock_guard<std::mutex> lk(g_scriptsLock);
+        double t = now_s();
+        for (auto &s : g_scripts) {
+            ScriptWatch &w = s.second;
+            BYTE b[0x100];
+            if (!safe_copy(b, (void *)s.first, sizeof b)) continue;
+            char line[512];
+            int len = sprintf_s(line, "marker %s: script %s object %08lx, 0->1 in the last 60 s:", q.c_str(),
+                                w.name.c_str(), (unsigned long)s.first);
+            int best = -1, found = 0;
+            for (int i = 0; i < 0x100; i++) {
+                if (b[i] != 1) continue;
+                double age = !w.b[i] ? 0 : w.flip[i] >= 0 ? t - w.flip[i] : 1e9;  // !w.b[i]: flipped this frame
+                if (age > 60) continue;
+                if (found++ < 12) len += sprintf_s(line + len, sizeof line - len, " +0x%02x (%.1f s)", i, age);
+                if (best < 0 || age < (!w.b[best] ? 0 : t - w.flip[best])) best = i;
+            }
+            if (!found) continue;
+            coop_log("%s", line);
+            wchar_t path[MAX_PATH];
+            swprintf_s(path, L"%s\\quest_markers.txt", g_profileDir);
+            if (FILE *f = _wfsopen(path, L"a", _SH_DENYWR)) {
+                fprintf(f, "%s %s +0x%02x\n", q.c_str(), w.name.c_str(), best);
+                fclose(f);
+            }
+        }
+    }
+    return real_SetCompleted(gsi, edx, quest, screen, a2, a3);
+}
+
 static bool g_active;
 
 extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD ver, REFIID iid, LPVOID *out, LPUNKNOWN outer)
@@ -879,6 +1087,11 @@ extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD ver, REFIID i
         if (g_active) {
             start_bridge();  // first call comes after loader lock, safe to start threads and wait on them
             net_init();
+            // the per-frame hook only runs in the world; achievements can fire from the menu or a save load
+            CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+                for (int i = 0; i < 2400 && !block_achievements(); i++) Sleep(50);
+                return 0;
+            }, NULL, 0, NULL);
         }
     }
     return real ? real(inst, ver, iid, out, outer) : E_FAIL;
@@ -911,6 +1124,8 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         bool hookAnim = ((void **)game_va(kAnimNodeSequenceVft))[kSetAnimSlot] == game_va(kSetAnim);
         if (hookAnim) hook_vftable_slot(kAnimNodeSequenceVft, kSetAnimSlot, (void *)hk_SetAnim, (void **)&real_SetAnim);
         coop_log("puppet hero-anim hook: %s", hookAnim ? "on" : "FAILED (unknown exe build)");
+        hook_vftable_slot(kGsiVftable, kGsiSetCompleted, (void *)hk_SetCompleted, (void **)&real_SetCompleted);
+        if (GetEnvironmentVariableA("FABLE_COOP_TRACE_GSI", NULL, 0)) trace_gsi_init();
     }
     return TRUE;
 }
