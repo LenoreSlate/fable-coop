@@ -422,8 +422,8 @@ static Value spawn_creature(const std::string &def, const float pos[3], bool scr
     return r;
 }
 
-// ---- network: local UDP between two game instances (Steam relay later) ----
-// FABLE_COOP_LISTEN=<port> and FABLE_COOP_PEER=<host:port> switch it on. Every 50 ms the local hero's
+// ---- network: two game instances over local UDP or the Steam relay ----
+// FABLE_COOP_LISTEN=<port> and FABLE_COOP_PEER=<host:port> (or FABLE_COOP_PEER=steam:<id>) switch it on. Every 50 ms the local hero's
 // position goes to the peer; received positions drive the puppet, which is spawned (or respawned after
 // the game removed it, e.g. on a region load) when positions arrive and the local hero exists.
 // Free co-op: each packet carries the sender's region (current map index, CWorldMap +0xbc; the 73-map
@@ -501,11 +501,79 @@ static BYTE *skel_of(DWORD thing)
     return skel;
 }
 
+// Steam relay: the game's own steam_api.dll (SDK of 2014, SteamNetworking005, no flat API) under the game's
+// AppID, so both players need to own the game and nobody uses Spacewar. FABLE_COOP_PEER=steam:<SteamID64>.
+// Both sides send to a known SteamID, which opens and accepts the session (the configured peer is also
+// accepted once a second), so no P2PSessionRequest callback is needed. Own channel, read only there.
+// ponytail: peer SteamID typed by hand; lobbies (SteamMatchmaking009) replace it for the Coop menu
+struct ISteamNetworking005 {  // vtable order of isteamnetworking.h; a CSteamID is passed as its uint64
+    virtual bool SendP2PPacket(unsigned long long to, const void *data, unsigned size, int sendType, int channel) = 0;
+    virtual bool IsP2PPacketAvailable(unsigned *size, int channel) = 0;
+    virtual bool ReadP2PPacket(void *dest, unsigned cap, unsigned *size, unsigned long long *from, int channel) = 0;
+    virtual bool AcceptP2PSessionWithUser(unsigned long long user) = 0;
+    virtual bool CloseP2PSessionWithUser(unsigned long long user) = 0;
+    virtual bool CloseP2PChannelWithUser(unsigned long long user, int channel) = 0;
+    virtual bool GetP2PSessionState(unsigned long long user, void *state) = 0;
+    virtual bool AllowP2PPacketRelay(bool allow) = 0;
+};
+struct SteamIdRet { unsigned long long v; };
+struct ISteamUser017 {  // first slots only
+    virtual int GetHSteamUser() = 0;
+    virtual bool BLoggedOn() = 0;
+    virtual SteamIdRet GetSteamID() = 0;
+};
+static const int kSteamChannel = 7, kSteamUnreliable = 0;
+static unsigned long long g_peerSteam;
+static const unsigned long long kSteamSelf = ~0ull;  // FABLE_COOP_PEER=steam:me
+static ISteamNetworking005 *g_steamNet;
+static double g_lastAccept;
+
+// The game initializes Steam itself; resolve the interface once it exists (called on the game thread).
+static ISteamNetworking005 *steam_net()
+{
+    if (g_steamNet) return g_steamNet;
+    HMODULE api = GetModuleHandleA("steam_api.dll");
+    auto net = api ? (ISteamNetworking005 *(__cdecl *)())GetProcAddress(api, "SteamNetworking") : nullptr;
+    auto user = api ? (ISteamUser017 *(__cdecl *)())GetProcAddress(api, "SteamUser") : nullptr;
+    if (!net || !(g_steamNet = net())) return nullptr;
+    g_steamNet->AllowP2PPacketRelay(true);
+    ISteamUser017 *u = user ? user() : nullptr;
+    unsigned long long me = u ? u->GetSteamID().v : 0;
+    if (g_peerSteam == kSteamSelf) g_peerSteam = me;  // loopback self-test on one PC, one account
+    coop_log("net: Steam P2P ready, me %llu, peer %llu", me, g_peerSteam);
+    return g_steamNet;
+}
+
+static bool net_on() { return g_sock != INVALID_SOCKET || g_peerSteam; }
+
+static void net_send(const NetPos &m)
+{
+    if (!g_peerSteam) sendto(g_sock, (const char *)&m, sizeof m, 0, (sockaddr *)&g_peer, sizeof g_peer);
+    else if (steam_net()) g_steamNet->SendP2PPacket(g_peerSteam, &m, sizeof m, kSteamUnreliable, kSteamChannel);
+}
+
+static bool net_recv(NetPos &m)
+{
+    if (!g_peerSteam) return recv(g_sock, (char *)&m, sizeof m, 0) == sizeof m;
+    unsigned size;
+    unsigned long long from;
+    while (steam_net() && g_steamNet->IsP2PPacketAvailable(&size, kSteamChannel))
+        if (!g_steamNet->ReadP2PPacket(&m, sizeof m, &size, &from, kSteamChannel)) return false;
+        else if (from == g_peerSteam && size == sizeof m) return true;
+    return false;
+}
+
 static void net_init()
 {
-    char listen[16] = "", peer[64] = "";
-    if (!GetEnvironmentVariableA("FABLE_COOP_LISTEN", listen, sizeof listen) ||
-        !GetEnvironmentVariableA("FABLE_COOP_PEER", peer, sizeof peer)) return;
+    char listen[16] = "", peer[64] = "", host[4] = "";
+    if (!GetEnvironmentVariableA("FABLE_COOP_PEER", peer, sizeof peer)) return;
+    g_host = GetEnvironmentVariableA("FABLE_COOP_HOST", host, sizeof host) && host[0] == '1';
+    if (!strncmp(peer, "steam:", 6)) {
+        g_peerSteam = strcmp(peer + 6, "me") ? _strtoui64(peer + 6, NULL, 10) : kSteamSelf;
+        coop_log("net: Steam peer %llu, %s", g_peerSteam, g_host ? "host" : "guest");
+        return;
+    }
+    if (!GetEnvironmentVariableA("FABLE_COOP_LISTEN", listen, sizeof listen)) return;
     char *colon = strrchr(peer, ':');
     WSADATA wsa;
     if (!colon || WSAStartup(MAKEWORD(2, 2), &wsa)) { coop_log("net: bad FABLE_COOP_PEER %s", peer); return; }
@@ -522,15 +590,17 @@ static void net_init()
         return;
     }
     g_sock = s;
-    char host[4] = "";
-    g_host = GetEnvironmentVariableA("FABLE_COOP_HOST", host, sizeof host) && host[0] == '1';
     coop_log("net: UDP listening on %s, peer %s:%s, %s", listen, peer, colon + 1, g_host ? "host" : "guest");
 }
 
 static void net_tick(Puppet &pp)
 {
-    if (g_sock == INVALID_SOCKET) return;
+    if (!net_on()) return;
     double now = now_s();
+    if (g_peerSteam && now - g_lastAccept >= 1 && steam_net()) {
+        g_steamNet->AcceptP2PSessionWithUser(g_peerSteam);
+        g_lastAccept = now;
+    }
     DWORD heroThing = hero_thing();
     float *hero = NULL;
     if (heroThing) safe_copy(&hero, (void *)(heroThing + 0x6c), 4);  // CTCPhysicsControlled
@@ -542,12 +612,12 @@ static void net_tick(Puppet &pp)
         if (!day || !safe_copy(&m.day, day, 4)) m.day = -1;
         main_anim(skel_of(heroThing), m.anim, sizeof m.anim, &m.animNum);
         if (safe_copy(m.v, hero + 0x0c / 4, 12) && safe_copy(m.v + 3, hero + 0x5c / 4, 8))
-            sendto(g_sock, (const char *)&m, sizeof m, 0, (sockaddr *)&g_peer, sizeof g_peer);
+            net_send(m);
         g_lastSend = now;
     }
     NetPos m;
     bool got = false;
-    while (recv(g_sock, (char *)&m, sizeof m, 0) == sizeof m)
+    while (net_recv(m))
         if (m.magic == kNetMagic) {
             if (m.region != g_peerRegion) coop_log("net: peer region %d (here %d)", m.region, here);
             g_peerRegion = m.region;

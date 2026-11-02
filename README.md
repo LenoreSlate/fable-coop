@@ -13,7 +13,8 @@ test log are in [games/fable-anniversary](https://github.com/cranebeaker/coop-an
 - Several copies run side by side, keep running in the background, and save into their own profile folder
   (never the player's real save or Steam Cloud).
 
-Not shared yet: enemies, quests, items, money. Transport is plain UDP; Steam relay is next.
+Not shared yet: enemies, quests, items, money. Transport: local UDP, or the Steam relay through the game's own
+`steam_api.dll` (both players need to own the game; checked so far only by a one-account loopback test).
 
 ## Build
 
@@ -33,7 +34,7 @@ Use a **copy** of the game folder, never your Steam install. Put `proxy\build\di
 |---|---|---|
 | `FABLE_COOP_PROFILE` | `p1` | Save folder: `<game dir>\CoopProfiles\<profile>` (log: `fable_coop.log` there) |
 | `FABLE_COOP_LISTEN` | `27960` | Local UDP port |
-| `FABLE_COOP_PEER` | `127.0.0.1:27961` | The other copy |
+| `FABLE_COOP_PEER` | `127.0.0.1:27961` | The other copy over UDP (needs `FABLE_COOP_LISTEN`), or `steam:<SteamID64>` for the other player over Steam (`steam:me`: loopback self-test) |
 | `FABLE_COOP_HOST` | `1` | Set on one copy only: its time of day wins |
 
 ## Tools
