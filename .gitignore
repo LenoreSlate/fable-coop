@@ -1,0 +1,3 @@
+proxy/build/
+__pycache__/
+*.pyc
