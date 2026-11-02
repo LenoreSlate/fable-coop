@@ -865,6 +865,8 @@ static void start_bridge()
 typedef HRESULT(WINAPI *DI8Create)(HINSTANCE, DWORD, REFIID, LPVOID *, LPUNKNOWN);
 
 // Exported undecorated via /EXPORT in build.bat.
+static bool g_active;
+
 extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD ver, REFIID iid, LPVOID *out, LPUNKNOWN outer)
 {
     static DI8Create real;
@@ -874,8 +876,10 @@ extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD ver, REFIID i
         strcat_s(path, "\\dinput8.dll");
         real = (DI8Create)GetProcAddress(LoadLibraryA(path), "DirectInput8Create");
         coop_log("real DirectInput8Create = %p (%s)", (void *)real, path);
-        start_bridge();  // first call comes after loader lock, safe to start threads and wait on them
-        net_init();
+        if (g_active) {
+            start_bridge();  // first call comes after loader lock, safe to start threads and wait on them
+            net_init();
+        }
     }
     return real ? real(inst, ver, iid, out, outer) : E_FAIL;
 }
@@ -884,6 +888,10 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(self);
+        // Installed in a player's own game folder, the DLL stays inert unless the co-op launcher (or a test)
+        // set FABLE_COOP_PROFILE: a normal start from Steam is the unmodded game with its real saves.
+        g_active = GetEnvironmentVariableA("FABLE_COOP_PROFILE", NULL, 0) > 0;
+        if (!g_active) return TRUE;
         g_exeBase = (BYTE *)GetModuleHandleA(NULL);
         init_profile();
         char logname[MAX_PATH];

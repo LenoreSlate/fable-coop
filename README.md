@@ -16,6 +16,22 @@ test log are in [games/fable-anniversary](https://github.com/cranebeaker/coop-an
 Not shared yet: enemies, quests, items, money. Transport: local UDP, or the Steam relay through the game's own
 `steam_api.dll` (both players need to own the game; checked so far only by a one-account loopback test).
 
+## Play with a friend (Steam)
+
+Both players need Fable Anniversary on Steam. Each runs `FableCoop.bat` (one file, built by `kit/make_kit.py`;
+the mod DLL and its SHA-256 are inside) and picks:
+
+1. **Install**: finds the game through Steam's library folders (or `--game-dir`), refuses a game build other than
+   the one tested, backs up any `dinput8.dll` already there, writes `dinput8.dll` and `steam_appid.txt`.
+2. **Play**: shows your SteamID64 (send it to your friend), asks for theirs and who hosts, copies your saves into
+   `<game dir>\CoopProfiles\coop` the first time (the originals are never touched), and starts the game.
+3. **Uninstall**: removes what install created and puts the old `dinput8.dll` back. Co-op saves stay.
+
+Started from Steam as usual, the game is unmodded: the DLL does nothing unless the kit (or a test) set
+`FABLE_COOP_PROFILE`. Windows may show "Windows protected your PC" for a downloaded `.bat`: More info > Run anyway.
+Command line: `FableCoop.bat install | play host|guest <SteamID64> | uninstall [--game-dir <dir>] [--yes]`.
+Tests: `powershell -File kit\test_kit.ps1 <fixture>` (fake Steam folder; see the script header).
+
 ## Build
 
 32-bit MSVC (Build Tools 2022). The coopbridge headers come from a coop-anything checkout next to this repo

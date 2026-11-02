@@ -1,0 +1,187 @@
+<# : FableCoop.bat - one file: install, play and uninstall the Fable Anniversary co-op mod (fable-coop).
+@echo off
+setlocal
+set "FC_SELF=%~f0"
+set "FC_ARGS=%*"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ([IO.File]::ReadAllText($env:FC_SELF))"
+set "FC_EXIT=%errorlevel%"
+if not defined FC_ARGS pause
+exit /b %FC_EXIT%
+#>
+# Usage: FableCoop.bat [install | play host|guest <SteamID64> | uninstall] [--game-dir <dir>] [--yes]
+# No argument: a menu. Built by kit/make_kit.py, which embeds the mod DLL and its SHA-256.
+# Test overrides: COOP_STEAM_ROOT (a fake Steam folder), FC_DOCUMENTS (fake Documents), FC_NO_LAUNCH=1 (play stops before starting the game).
+$ErrorActionPreference = 'Stop'
+$AppId = 288470
+$ExeSha = '2a95eea3c2cce9b47ca0f454a605b6952216f5d25158efd12ba48b70130989f2'  # Steam build 434572, the build tested
+$DllSha = '@DLL_SHA@'
+$DllB64 = '@DLL_B64@'
+$Version = '@VERSION@'
+$CoopProfile = 'coop'
+
+$argv = @(); if ($env:FC_ARGS) { $argv = @([regex]::Matches($env:FC_ARGS, '"[^"]*"|\S+') | ForEach-Object { $_.Value.Trim('"') }) }
+$GameDir = $null; $Yes = $false; $rest = @()
+for ($i = 0; $i -lt $argv.Count; $i++) {
+    if ($argv[$i] -eq '--game-dir') { $GameDir = $argv[++$i].Trim('"') }
+    elseif ($argv[$i] -eq '--yes') { $Yes = $true }
+    else { $rest += $argv[$i] }
+}
+$script:LogFile = $null
+
+function Say($msg) { Write-Host $msg; if ($script:LogFile) { Add-Content -LiteralPath $script:LogFile -Value "$(Get-Date -Format s) $msg" } }
+function Fail($msg) {
+    Say ''
+    Say '  *** Probleme ***'
+    Say "  $msg"
+    if ($script:LogFile) { Say "  Journal : $script:LogFile" }
+    exit 1
+}
+
+function Steam-Root {
+    if ($env:COOP_STEAM_ROOT) { return $env:COOP_STEAM_ROOT }
+    foreach ($k in @(@('HKCU:\Software\Valve\Steam', 'SteamPath'), @('HKLM:\SOFTWARE\WOW6432Node\Valve\Steam', 'InstallPath'))) {
+        try { $v = (Get-ItemProperty -Path $k[0] -Name $k[1]).($k[1]); if ($v -and (Test-Path $v)) { return $v } } catch {}
+    }
+    return $null
+}
+
+function Find-Game {
+    if ($GameDir) { return $GameDir }
+    $steam = Steam-Root
+    if (-not $steam) { return $null }
+    $libs = @($steam)
+    $vdf = Join-Path $steam 'steamapps\libraryfolders.vdf'
+    if (Test-Path $vdf) {
+        foreach ($m in [regex]::Matches((Get-Content -Raw $vdf), '"path"\s+"([^"]+)"')) { $libs += $m.Groups[1].Value -replace '\\\\', '\' }
+    }
+    foreach ($lib in $libs) {
+        $acf = Join-Path $lib "steamapps\appmanifest_$AppId.acf"
+        if (Test-Path $acf) {
+            $m = [regex]::Match((Get-Content -Raw $acf), '"installdir"\s+"([^"]+)"')
+            if ($m.Success) { $d = Join-Path $lib ('steamapps\common\' + $m.Groups[1].Value); if (Test-Path $d) { return $d } }
+        }
+    }
+    return $null
+}
+
+function My-SteamId {
+    # The logged-in account (32-bit id) while Steam runs; recent Steam no longer writes MostRecent in loginusers.vdf
+    if (-not $env:COOP_STEAM_ROOT) {
+        try { $u = (Get-ItemProperty 'HKCU:\Software\Valve\Steam\ActiveProcess' -Name ActiveUser).ActiveUser; if ($u) { return [string](76561197960265728 + [uint64]$u) } } catch {}
+    }
+    $steam = Steam-Root
+    if (-not $steam) { return $null }
+    $f = Join-Path $steam 'config\loginusers.vdf'
+    if (-not (Test-Path $f)) { return $null }
+    foreach ($m in [regex]::Matches((Get-Content -Raw $f), '"(\d{17})"\s*\{([^}]*)\}')) {
+        if ($m.Groups[2].Value -match '"MostRecent"\s+"1"') { return $m.Groups[1].Value }
+    }
+    return $null
+}
+
+# .NET, not Get-FileHash: started from PowerShell 7, Windows PowerShell inherits a PSModulePath without it
+function Sha($path) {
+    $s = [IO.File]::OpenRead($path)
+    try { -join ([Security.Cryptography.SHA256]::Create().ComputeHash($s) | ForEach-Object { $_.ToString('x2') }) } finally { $s.Dispose() }
+}
+
+# --- locate and check the game ---
+$game = Find-Game
+if (-not $game -or -not (Test-Path (Join-Path $game 'Binaries\Win32\Fable Anniversary.exe'))) {
+    Fail "Fable Anniversary est introuvable. Installe-le avec Steam, ou relance avec : FableCoop.bat --game-dir ""<dossier du jeu>"""
+}
+$bin = Join-Path $game 'Binaries\Win32'
+$exe = Join-Path $bin 'Fable Anniversary.exe'
+$dll = Join-Path $bin 'dinput8.dll'
+$appidFile = Join-Path $bin 'steam_appid.txt'
+$profileDir = Join-Path $game "CoopProfiles\$CoopProfile"
+$manifest = Join-Path $game 'CoopProfiles\installed.txt'  # what the installer created, for uninstall
+New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+$script:LogFile = Join-Path $game 'CoopProfiles\kit.log'
+Say "Fable Coop $Version - jeu : $game"
+
+function Installed { (Test-Path $dll) -and ((Sha $dll) -eq $DllSha) }
+
+function Do-Install {
+    if ((Sha $exe) -ne $ExeSha -and -not $Yes) {
+        Fail "Ta version du jeu n'est pas celle testee. Dans Steam : clic droit sur Fable Anniversary > Proprietes > Fichiers installes > Verifier l'integrite. Puis relance."
+    }
+    if (Installed) { Say 'Le mod est deja installe et a jour.'; return }
+    $created = @()
+    if (Test-Path $manifest) { $created = @(Get-Content $manifest) }
+    try {
+        if ((Test-Path $dll) -and -not (Test-Path "$dll.fablecoop-backup")) {
+            $isOurs = $created -contains 'dinput8.dll'
+            if (-not $isOurs) { Copy-Item -LiteralPath $dll "$dll.fablecoop-backup"; Say 'Ancien dinput8.dll sauvegarde (dinput8.dll.fablecoop-backup).' }
+        }
+        [IO.File]::WriteAllBytes($dll, [Convert]::FromBase64String($DllB64))
+        if ($created -notcontains 'dinput8.dll') { $created += 'dinput8.dll' }
+        if (-not (Test-Path $appidFile)) { Set-Content -LiteralPath $appidFile -Value $AppId -NoNewline -Encoding Ascii; $created += 'steam_appid.txt' }
+        Set-Content -LiteralPath $manifest -Value $created
+    } catch [UnauthorizedAccessException] {
+        Fail 'Windows refuse l''ecriture dans le dossier du jeu. Clic droit sur FableCoop.bat > Executer en tant qu''administrateur.'
+    }
+    if (-not (Installed)) { Fail 'Le fichier du mod ne correspond pas apres ecriture (antivirus ?).' }
+    Say 'Mod installe. Lance par Steam, le jeu reste normal ; le co-op ne demarre que par ce fichier (choix 2).'
+}
+
+function Do-Uninstall {
+    $created = @(); if (Test-Path $manifest) { $created = @(Get-Content $manifest) }
+    if ((Test-Path $dll) -and ((Sha $dll) -eq $DllSha -or $created -contains 'dinput8.dll')) { Remove-Item -LiteralPath $dll }
+    if (Test-Path "$dll.fablecoop-backup") { Move-Item -LiteralPath "$dll.fablecoop-backup" $dll; Say 'Ancien dinput8.dll remis en place.' }
+    if ($created -contains 'steam_appid.txt' -and (Test-Path $appidFile)) { Remove-Item -LiteralPath $appidFile }
+    if (Test-Path $manifest) { Remove-Item -LiteralPath $manifest }
+    Say 'Mod desinstalle. Les sauvegardes co-op restent dans :'
+    Say "  $(Join-Path $game 'CoopProfiles')  (supprime ce dossier si tu n'en veux plus)"
+}
+
+function Do-Play($role, $peer) {
+    if (-not (Installed)) { Do-Install }
+    if (Get-Process -Name 'Fable Anniversary' -ErrorAction SilentlyContinue) { Fail 'Fable Anniversary tourne deja. Ferme-le, puis relance.' }
+    if (-not $env:COOP_STEAM_ROOT -and -not (Get-Process -Name 'steam' -ErrorAction SilentlyContinue)) { Fail 'Steam n''est pas lance. Ouvre Steam, connecte-toi, puis relance.' }
+    $me = My-SteamId
+    if ($me) { Say "Ton identifiant Steam : $me   (envoie-le a ton ami)" }
+    $peerFile = Join-Path $profileDir 'peer.txt'
+    if (-not $peer -and (Test-Path $peerFile)) {
+        $old = (Get-Content $peerFile -Raw).Trim()
+        $ans = Read-Host "Identifiant Steam de ton ami [$old] (Entree = le meme)"
+        $peer = if ($ans) { $ans.Trim() } else { $old }
+    }
+    if (-not $peer) { $peer = (Read-Host 'Identifiant Steam de ton ami (17 chiffres, commence par 7656119)').Trim() }
+    if ($peer -notmatch '^7656119\d{10}$') { Fail "Identifiant Steam invalide : '$peer'. Il fait 17 chiffres et commence par 7656119 (Steam > profil > Details du compte)." }
+    if ($me -and $peer -eq $me) { Fail 'C''est ton propre identifiant : il faut celui de ton ami.' }
+    Set-Content -LiteralPath $peerFile -Value $peer
+    if (-not $role) { $r = Read-Host 'Qui heberge ? H = moi, R = je rejoins mon ami'; $role = if ($r -match '^[hH]') { 'host' } else { 'guest' } }
+    # Co-op saves live in CoopProfiles\coop; the first time, copy (never move) the player's real saves there.
+    $docs = if ($env:FC_DOCUMENTS) { $env:FC_DOCUMENTS } else { [Environment]::GetFolderPath('MyDocuments') }
+    $realSaves = Join-Path $docs 'My Games\FableHD'
+    $coopSaves = Join-Path $profileDir 'My Games\FableHD'
+    if (-not (Test-Path $coopSaves) -and (Test-Path $realSaves)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $coopSaves) | Out-Null
+        Copy-Item -Recurse -LiteralPath $realSaves $coopSaves
+        Say 'Tes sauvegardes ont ete copiees pour le co-op (les originales ne sont pas touchees).'
+    }
+    $env:FABLE_COOP_PROFILE = $CoopProfile
+    $env:FABLE_COOP_PEER = "steam:$peer"
+    $env:FABLE_COOP_HOST = if ($role -eq 'host') { '1' } else { '0' }
+    Say "Lancement en co-op ($role) avec $peer. Chargez chacun une partie et retrouvez-vous dans la meme region."
+    if ($env:FC_NO_LAUNCH) { return }
+    Start-Process -FilePath $exe -WorkingDirectory $bin
+}
+
+$cmd = if ($rest.Count) { $rest[0] } else { $null }
+if (-not $cmd) {
+    Say ''
+    Say '  1. Installer ou mettre a jour le mod'
+    Say '  2. Jouer en co-op'
+    Say '  3. Desinstaller'
+    Say '  4. Quitter'
+    switch (Read-Host 'Choix') { '1' { $cmd = 'install' } '2' { $cmd = 'play' } '3' { $cmd = 'uninstall' } default { exit 0 } }
+}
+switch ($cmd) {
+    'install' { Do-Install }
+    'uninstall' { Do-Uninstall }
+    'play' { Do-Play $(if ($rest.Count -gt 1) { $rest[1] }) $(if ($rest.Count -gt 2) { $rest[2] }) }
+    default { Fail "Commande inconnue : $cmd (install, play, uninstall)" }
+}
+exit 0
