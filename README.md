@@ -10,10 +10,12 @@ test log are in [games/fable-anniversary](https://github.com/cranebeaker/coop-an
 
 - Each copy shows the other player's hero as a puppet in the same region: position, facing, animations.
 - The guest follows the host's time of day.
-- Enemies placed in the world (not yet those spawned by generators): health and death are shared both ways, and each
-  enemy is run by the game of the player who came within 30 m of it first while the other game mirrors its position
-  and animations. Tested with one player near an enemy (a stone troll wakes for the guest with the host far away);
-  with both players near the same enemy it still fights only its owner's hero.
+- Enemies placed in the world (not yet those spawned by generators): health and death are shared both ways. The game
+  of the closer player within 30 m runs each enemy while the other game mirrors its position and animations; in a
+  fight the enemy stays with that player while they are within 35 m. Tested with the guest waking a stone troll while
+  the host watched, then with both heroes fighting it; it fights only its owner's hero.
+- A nymph's summoned scorpions are shared: the summoning game runs them and the other shows mirrors. A troll's thrown
+  rocks show on both screens (position only: no spin, no impact effect).
 - Several copies run side by side, keep running in the background, and save into their own profile folder
   (never the player's real save or Steam Cloud).
 
