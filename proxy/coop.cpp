@@ -16,6 +16,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -287,12 +288,19 @@ static const ULONG_PTR kAnimNodeSequenceVft = 0x2b43090, kSetAnimSlot = 0x19c / 
 typedef void(__fastcall *SetAnimFn)(BYTE *node, void *edx, int name, int number);
 static SetAnimFn real_SetAnim;
 static BYTE *g_puppetSkel;  // the puppet's SkeletalMeshComponent, null when no puppet
+static std::map<BYTE *, std::pair<int, int>> g_drivenSkel;  // driven enemy's mesh -> host's anim (GNames index, number)
 static int g_peerAnim = -1; // GNames index of the remote hero's main anim, -1 unknown
 static int g_peerAnimNum;   // its FName number: variants share a name (ANIM_HERO_IDLE 0, 3..10; combat idle is 2)
 static void __fastcall hk_SetAnim(BYTE *node, void *edx, int name, int number)
 {
     static int idle = -1, walk = -1, run = -1;
     static DWORD lookedAt;
+    if (!g_drivenSkel.empty()) {  // guest copies of the host's enemies play the host's anims
+        auto it = g_drivenSkel.find(*(BYTE **)(node + 0x5c));
+        // The owner's anim; when the owner has none playing (a far hero: its game does not animate it), the copy's
+        // own (a sleeping stone troll's rock pose). Dropping those left the mesh's standing pose (owner, 2026-11-03).
+        if (it != g_drivenSkel.end() && it->second.first >= 0) name = it->second.first, number = it->second.second;
+    }
     if (g_puppetSkel && *(BYTE **)(node + 0x5c) == g_puppetSkel) {
         if (g_peerAnim >= 0) name = g_peerAnim, number = g_peerAnimNum;
         else {
@@ -581,21 +589,273 @@ static bool block_achievements()
 
 static bool net_on() { return g_sock != INVALID_SOCKET || g_peerSteam; }
 
-static void net_send(const NetPos &m)
+static void net_send(const void *m, int size)
 {
-    if (!g_peerSteam) sendto(g_sock, (const char *)&m, sizeof m, 0, (sockaddr *)&g_peer, sizeof g_peer);
-    else if (steam_net()) g_steamNet->SendP2PPacket(g_peerSteam, &m, sizeof m, kSteamUnreliable, kSteamChannel);
+    if (!g_peerSteam) sendto(g_sock, (const char *)m, size, 0, (sockaddr *)&g_peer, sizeof g_peer);
+    else if (steam_net()) g_steamNet->SendP2PPacket(g_peerSteam, m, size, kSteamUnreliable, kSteamChannel);
 }
 
-static bool net_recv(NetPos &m)
+// One packet into buf; returns its size, 0 when none is waiting. Every packet starts with its magic.
+static int net_recv(void *buf, int cap)
 {
-    if (!g_peerSteam) return recv(g_sock, (char *)&m, sizeof m, 0) == sizeof m;
+    if (!g_peerSteam) {
+        int n = recv(g_sock, (char *)buf, cap, 0);
+        return n >= 4 ? n : 0;
+    }
     unsigned size;
     unsigned long long from;
     while (steam_net() && g_steamNet->IsP2PPacketAvailable(&size, kSteamChannel))
-        if (!g_steamNet->ReadP2PPacket(&m, sizeof m, &size, &from, kSteamChannel)) return false;
-        else if (from == g_peerSteam && size == sizeof m) return true;
-    return false;
+        if (!g_steamNet->ReadP2PPacket(buf, cap, &size, &from, kSteamChannel)) return 0;
+        else if (from == g_peerSteam && size >= 4) return (int)size;
+    return 0;
+}
+
+// ---- enemy health sync ----
+// Both games run their own enemies; what is shared is health. Placed creatures carry the same id (CThing +0x14) in
+// every copy loaded from the same save (checked on two copies, 2026-11-03). CThingAICreature +0xcc max health,
+// +0xd0 health (float). Each game sums the health changes it saw itself per id (damage < 0) and sends those totals
+// for 5 s after the last change, so a lost packet costs nothing: the peer applies the part of the total it has not
+// applied yet. Writing health to 0 does not kill: the game kills through a CCreatureAction_Die (as GSI 0x1c8fd50
+// does): 0x1bc03f0(holder; thing, 0) builds it, 0x1f42f70(thing; holder) queues it, 0x1beec00(holder) releases.
+// ponytail: health and death only; enemies still move and aim at their own game's hero (positions next).
+// ponytail: creatures found by a 2 s memory scan (~0.4 s of a background thread); hook their update once known.
+static const ULONG_PTR kAICreatureVft = 0x2f1afe4;
+static const DWORD kHpMagic = 0x31484346;  // "FCH1"
+// Placed creatures had ids 0x4c6..0x742; generator spawns and our puppet 0x6574b and up, counted per copy, so the
+// same id can be two different creatures. ponytail: guessed bound; match generator spawns by generator + order.
+static const DWORD kPlacedIdLimit = 0x10000;
+struct HpEntry { DWORD uid; float dealt; };
+struct NetHp { DWORD magic; int region; int count; HpEntry e[60]; };
+struct EnemyState { DWORD thing; float last; float dealt; float peerApplied; double changed; bool seen; };
+static std::map<DWORD, EnemyState> g_enemies;  // by id (game thread only)
+static std::vector<DWORD> g_creatureScan;      // candidate things from the last scan
+static std::mutex g_creatureScanLock;
+static double g_lastHpSend;
+
+static Value scan_u32(ULONG_PTR value, size_t limit);
+static void scan_creatures_forever()
+{
+    for (;;) {
+        Value hits = scan_u32((ULONG_PTR)game_va(kAICreatureVft), 4000);
+        std::vector<DWORD> found;
+        for (const Value &h : hits.items()) found.push_back(strtoul(h.str().c_str(), NULL, 16));
+        {
+            std::lock_guard<std::mutex> lk(g_creatureScanLock);
+            g_creatureScan.swap(found);
+        }
+        Sleep(2000);
+    }
+}
+
+// A live creature: our vftable, an id, sane health, and a physics component that points back at it.
+static bool creature_at(DWORD t, DWORD *uid, float hp[2])
+{
+    DWORD head[2], phys = 0, owner = 0;
+    if (!safe_copy(head, (void *)t, 4) || head[0] != (DWORD)game_va(kAICreatureVft) || !safe_copy(uid, (void *)(t + 0x14), 4) ||
+        !*uid || !safe_copy(hp, (void *)(t + 0xcc), 8) || !(hp[0] > 0 && hp[0] < 1e6f) || !(hp[1] >= -1e6f && hp[1] <= hp[0]) ||
+        !safe_copy(&phys, (void *)(t + 0x6c), 4) || !phys || !safe_copy(&owner, (void *)(phys + 4), 4))
+        return false;
+    return owner == t;
+}
+
+static void kill_creature(DWORD t)
+{
+    static BYTE holder[0x40];
+    DWORD ret, args[2] = {t, 0}, p;
+    float zero = 0;
+    safe_copy((void *)(t + 0xd0), &zero, 4);
+    if (!safe_call(game_va(0x1bc03f0), (DWORD)holder, args, 2, &p)) { coop_log("enemy %08lx: die action faulted", (unsigned long)t); return; }
+    safe_call(game_va(0x1f42f70), t, &p, 1, &ret);
+    safe_call(game_va(0x1beec00), (DWORD)holder, NULL, 0, &ret);
+}
+
+static void enemies_tick(int here, double now)
+{
+    std::vector<DWORD> scan;
+    {
+        std::lock_guard<std::mutex> lk(g_creatureScanLock);
+        scan = g_creatureScan;
+    }
+    for (auto &e : g_enemies) e.second.seen = false;
+    for (DWORD t : scan) {
+        DWORD uid;
+        float hp[2];
+        if (!creature_at(t, &uid, hp) || uid >= kPlacedIdLimit) continue;
+        auto it = g_enemies.find(uid);
+        if (it == g_enemies.end()) {
+            g_enemies[uid] = {t, hp[1], 0, 0, -1, true};
+            continue;
+        }
+        EnemyState &s = it->second;
+        if (s.seen) continue;  // a stale copy of a creature already found this tick
+        s.seen = true;
+        if (s.thing != t) { s.thing = t; s.last = hp[1]; continue; }  // reloaded: new body, no change to report
+        if (hp[1] != s.last) {
+            s.dealt += hp[1] - s.last;
+            s.last = hp[1];
+            s.changed = now;
+        }
+    }
+    if (here < 0 || g_peerRegion != here || now - g_lastHpSend < 0.1) return;
+    g_lastHpSend = now;
+    NetHp m = {kHpMagic, here, 0};
+    for (auto &e : g_enemies)
+        if (e.second.changed >= 0 && now - e.second.changed < 5 && m.count < 60)
+            m.e[m.count++] = {e.first, e.second.dealt};
+    if (m.count) net_send(&m, offsetof(NetHp, e) + m.count * sizeof(HpEntry));
+}
+
+static void enemies_recv(const NetHp &m, int size, int here)
+{
+    if (m.region != here || m.count < 0 || m.count > 60 || size < (int)(offsetof(NetHp, e) + m.count * sizeof(HpEntry))) return;
+    for (int i = 0; i < m.count; i++) {
+        auto it = g_enemies.find(m.e[i].uid);
+        if (it == g_enemies.end()) continue;  // not loaded here
+        EnemyState &s = it->second;
+        float delta = m.e[i].dealt - s.peerApplied, hp[2];
+        DWORD uid;
+        if (delta == 0 || !creature_at(s.thing, &uid, hp) || uid != it->first) continue;
+        s.peerApplied = m.e[i].dealt;
+        float to = fminf(hp[0], fmaxf(0, hp[1] + delta));
+        safe_copy((void *)(s.thing + 0xd0), &to, 4);
+        s.last = to;
+        coop_log("enemy %lx: peer dealt %.0f, health %.0f -> %.0f", (unsigned long)it->first, -delta, hp[1], to);
+        if (to <= 0 && hp[1] > 0) kill_creature(s.thing);
+    }
+}
+
+// ---- enemy movement: the closer player's AI drives, the other game's copy follows ----
+// Free co-op: a troll must wake for the guest even with the host far away (owner, 2026-11-03), so each enemy
+// belongs to the player whose hero came within 30 m first, host or guest (host takes ties and keeps it on a brief
+// double claim), and stays with that player while their hero is within 35 m: the other game's copy never woke (its
+// AI state is spread over the troll's combat states), so a hand-over mid-fight replayed the troll's rise (owner).
+// Nobody that near: each game runs its own copy (a sleeping troll stays asleep in both).
+// Owner: every 0.1 s, position, facing and main anim of each creature it owns ("FCE1", 12 per packet).
+// Other side: a creature the peer reports is teleported every frame to the peer's position 0.1 s late (navigator
+// slot 0x90, like the puppet) and plays the peer's anims (SetAnim hook). Its brain still runs: harmless while its
+// own hero is far (the owner is the one near). The brain byte [[brain+0x44]+0x10] the first puppet used is no pause:
+// it marks the current behaviour done, so the brain picked a new one each frame and a troll near the guest's hero
+// started rising 4 times a second (rubble, sound, red eyes). Creature slot 0xc8 (0x1f3b830) is not the per-frame
+// brain update either (hooked, never called for these).
+// ponytail: 30 m guessed from the troll's wake range; an enemy fights only its owner's hero, and a copy near its own
+// hero may still think (both players near one enemy: freeze the brain fibre, target the puppet, next).
+static const DWORD kEnemyPosMagic = 0x31454346;  // "FCE1"
+struct EnemyPos { DWORD uid; float v[5]; char anim[64]; int animNum; };  // creature anim names reach 43 chars
+struct NetEnemyPos { DWORD magic; int region; int count; EnemyPos e[12]; };  // 1116 bytes, under 1200
+struct Driven { std::deque<PuppetSample> s; std::string animName; int anim = -1, animNum = 0; double lastRecv = 0; DWORD thing = 0; BYTE *skel = nullptr; };
+static std::map<DWORD, Driven> g_driven;  // driven by the peer, by id
+static std::set<DWORD> g_owned;           // ours, sent to the peer
+// Anim name -> GNames index (ponytail: cached for good, names only grow). File scope on purpose: as a function-local
+// static its thread-safe init guard stayed "in progress" and the game thread waited on it for good (p2 hung at the
+// first anim name from the peer, 2026-11-03; cause of the stuck guard not found).
+static std::map<std::string, int> g_animIds;
+static float g_heroPos[3], g_peerPos[3];  // this region only
+static double g_lastPosSend;
+
+// Whether this game's hero is the closer one to the enemy at `pos`, per the rule above.
+static bool closer_here(DWORD uid, const float *pos)
+{
+    auto d2 = [&](const float *a) { float x = a[0] - pos[0], y = a[1] - pos[1], z = a[2] - pos[2]; return sqrtf(x * x + y * y + z * z); };
+    float mine = d2(g_heroPos), lead = d2(g_peerPos) - mine;
+    bool kept = g_owned.count(uid) != 0;
+    if (mine > (kept ? 35.f : 30.f)) return false;  // nobody near: each game's own AI (a troll sleeps; paused, it never does)
+    if (kept) return true;  // the other game's copy never woke: handing over mid-fight made the troll rise again (owner)
+    return lead > (g_host ? -1.5f : 1.5f);  // host takes ties: an enemy never goes ownerless
+}
+
+
+static void enemies_send_positions(int here, double now)
+{
+    if (here < 0 || g_peerRegion != here) { g_owned.clear(); return; }
+    if (now - g_lastPosSend < 0.1) return;
+    g_lastPosSend = now;
+    NetEnemyPos m = {kEnemyPosMagic, here, 0};
+    auto flush = [&] {
+        if (m.count) net_send(&m, offsetof(NetEnemyPos, e) + m.count * sizeof(EnemyPos));
+        m.count = 0;
+    };
+    for (auto &e : g_enemies) {
+        if (!e.second.seen) continue;
+        float *phys = nullptr;
+        EnemyPos &p = m.e[m.count];
+        if (g_driven.count(e.first) || !safe_copy(&phys, (void *)(e.second.thing + 0x6c), 4) || !phys ||
+            !safe_copy(p.v, phys + 0x0c / 4, 12) || !safe_copy(p.v + 3, phys + 0x5c / 4, 8))
+            continue;
+        if (!closer_here(e.first, p.v)) { g_owned.erase(e.first); continue; }
+        g_owned.insert(e.first);
+        p.uid = e.first;
+        main_anim(skel_of(e.second.thing), p.anim, sizeof p.anim, &p.animNum);
+        if (++m.count == 12) flush();
+    }
+    flush();
+}
+
+static void enemies_pos_recv(const NetEnemyPos &m, int size, int here, double now)
+{
+    if (m.region != here || m.count < 0 || m.count > 12 || size < (int)(offsetof(NetEnemyPos, e) + m.count * sizeof(EnemyPos))) return;
+    for (int i = 0; i < m.count; i++) {
+        const EnemyPos &p = m.e[i];
+        auto it = g_enemies.find(p.uid);
+        if (it == g_enemies.end() || !it->second.seen) continue;  // not loaded here
+        if (g_owned.count(p.uid)) {
+            if (g_host) continue;  // both claimed it for a moment (lag): the host keeps it
+            g_owned.erase(p.uid);
+        }
+        Driven &d = g_driven[p.uid];
+        if (d.thing != it->second.thing) {
+            d.thing = it->second.thing;
+            d.s.clear();
+            coop_log("enemy %lx: driven by the peer", (unsigned long)p.uid);
+        }
+        d.lastRecv = now;
+        PuppetSample smp = {now};
+        memcpy(smp.v, p.v, sizeof smp.v);
+        d.s.push_back(smp);
+        while (d.s.size() > 20) d.s.pop_front();
+        char name[sizeof p.anim];
+        strncpy_s(name, p.anim, _TRUNCATE);
+        if (d.animName != name) {  // "": the host's copy plays none
+            auto &ids = g_animIds;
+            auto found = ids.find(name);
+            int id = !name[0] ? -1 : found != ids.end() ? found->second : ue_find(name);
+            if (id >= 0) ids[name] = id;
+            d.animName = name;
+            d.anim = id;
+        }
+        d.animNum = p.animNum;
+    }
+}
+
+static void enemies_drive(double now)
+{
+    for (auto it = g_driven.begin(); it != g_driven.end();) {
+        Driven &d = it->second;
+        DWORD uid;
+        float hp[2];
+        bool alive = creature_at(d.thing, &uid, hp) && uid == it->first;
+        if (d.skel) g_drivenSkel.erase(d.skel);
+        if (!alive || now - d.lastRecv > 0.5) {
+            if (alive) coop_log("enemy %lx: peer stopped, own AI back", (unsigned long)it->first);
+            it = g_driven.erase(it);
+            continue;
+        }
+        float *phys = nullptr, v[5];
+        if (!d.s.empty() && safe_copy(&phys, (void *)(d.thing + 0x6c), 4) && phys) {
+            sample_at(d.s, now - 0.1, v);
+            place_puppet(phys, v);
+        }
+        d.skel = skel_of(d.thing);
+        if (d.skel) g_drivenSkel[d.skel] = {d.anim, d.animNum};
+        if (d.skel && d.anim >= 0) {
+            BYTE *seq[64];
+            for (int i = 0, n = anim_sequences(d.skel, seq, 64); i < n; i++) {
+                DWORD name[2], ret, args[2] = {(DWORD)d.anim, (DWORD)d.animNum};
+                if (safe_copy(name, seq[i] + 0xf0, 8) && (name[0] != args[0] || name[1] != args[1]))
+                    safe_call((void *)real_SetAnim, (DWORD)seq[i], args, 2, &ret);
+            }
+        }
+        ++it;
+    }
 }
 
 static void net_init()
@@ -647,13 +907,23 @@ static void net_tick(Puppet &pp)
         if (!day || !safe_copy(&m.day, day, 4)) m.day = -1;
         main_anim(skel_of(heroThing), m.anim, sizeof m.anim, &m.animNum);
         if (safe_copy(m.v, hero + 0x0c / 4, 12) && safe_copy(m.v + 3, hero + 0x5c / 4, 8))
-            net_send(m);
+            net_send(&m, sizeof m);
         g_lastSend = now;
     }
-    NetPos m;
+    if (hero) {
+        safe_copy(g_heroPos, hero + 0x0c / 4, 12);
+        enemies_tick(here, now);
+        enemies_send_positions(here, now);
+    }
+    union { NetPos pos; NetHp hp; NetEnemyPos epos; DWORD magic; } pkt;
+    NetPos &m = pkt.pos;
     bool got = false;
-    while (net_recv(m))
-        if (m.magic == kNetMagic) {
+    for (int size; (size = net_recv(&pkt, sizeof pkt));)
+        if (pkt.magic == kHpMagic) {
+            if (hero) enemies_recv(pkt.hp, size, here);
+        } else if (pkt.magic == kEnemyPosMagic) {
+            if (hero) enemies_pos_recv(pkt.epos, size, here, now);
+        } else if (pkt.magic == kNetMagic && size == sizeof m) {
             if (m.region != g_peerRegion) coop_log("net: peer region %d (here %d)", m.region, here);
             g_peerRegion = m.region;
             g_lastRecv = now;
@@ -673,12 +943,14 @@ static void net_tick(Puppet &pp)
             }
             g_peerAnimNum = m.animNum;
             if (m.region != here) continue;
+            memcpy(g_peerPos, m.v, sizeof g_peerPos);
             PuppetSample smp = {now};
             memcpy(smp.v, m.v, sizeof smp.v);
             pp.samples.push_back(smp);
             if (pp.samples.size() > 200) pp.samples.pop_front();  // not driven (no puppet): keep it bounded
             got = true;
         }
+    if (hero) enemies_drive(now);
     DWORD thing = pp.actor ? thing_of(pp.actor + 0x14) : 0;
     g_puppetSkel = skel_of(thing);
     if (g_puppetSkel && g_peerAnim >= 0) {  // the game sets anims only on change: put the remote one on every node
@@ -1087,6 +1359,8 @@ extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD ver, REFIID i
         if (g_active) {
             start_bridge();  // first call comes after loader lock, safe to start threads and wait on them
             net_init();
+            if (net_on())
+                CreateThread(NULL, 0, [](LPVOID) -> DWORD { scan_creatures_forever(); return 0; }, NULL, 0, NULL);
             // the per-frame hook only runs in the world; achievements can fire from the menu or a save load
             CreateThread(NULL, 0, [](LPVOID) -> DWORD {
                 for (int i = 0; i < 2400 && !block_achievements(); i++) Sleep(50);
