@@ -330,9 +330,9 @@ static int anim_sequences(BYTE *skel, BYTE **out, int max)
     return n;
 }
 
-// Name and FName number of the sequence weighing most in the final pose ("" if none).
+// Name, FName number and time of the sequence weighing most in the final pose ("" if none).
 // ponytail: one anim; an upper-body anim over legs walking sends the walk. Send per-branch anims if attacks show it.
-static void main_anim(BYTE *skel, char *out, size_t size, int *number)
+static void main_anim(BYTE *skel, char *out, size_t size, int *number, float *time = nullptr)
 {
     BYTE *seq[64];
     int n = anim_sequences(skel, seq, 64), best = -1, name[2];
@@ -340,10 +340,29 @@ static void main_anim(BYTE *skel, char *out, size_t size, int *number)
     *number = 0;
     for (int i = 0; i < n; i++) {
         float w;
-        if (safe_copy(&w, seq[i] + 0x78, 4) && safe_copy(name, seq[i] + 0xf0, 8) && name[0] > 0 && w > bestW)
+        if (safe_copy(&w, seq[i] + 0x78, 4) && safe_copy(name, seq[i] + 0xf0, 8) && name[0] > 0 && w > bestW) {
             bestW = w, best = name[0], *number = name[1];
+            if (time) safe_copy(time, seq[i] + 0x100, 4);
+        }
     }
     strncpy_s(out, size, best > 0 ? ue_name(best) : "", _TRUNCATE);
+}
+
+// Puts an anim (GNames index, FName number) on every sequence node of `skel`, and its time when `time` >= 0.
+// The game moves anims itself: its nodes do not play (Rate 0, bPlaying off) and it sets CurrentTime every frame
+// (UE3 reflection on a fighting troll, 2026-11-03), so a copy given the owner's anim kept its own clock: a troll left
+// on the first frame of an attack slid along the ground (owner). UAnimNodeSequence: +0xf0 AnimSeqName, +0xfc bits
+// (bIsIssuingNotifies 0x200), +0x100 CurrentTime; SetPosition 0x8055b0 (vftable slot 0x1a0) clamps to the anim.
+static void force_anim(BYTE *skel, int anim, int number, float time = -1)
+{
+    BYTE *seq[64];
+    for (int i = 0, n = anim_sequences(skel, seq, 64); i < n; i++) {
+        DWORD name[2], bits, ret, args[2] = {(DWORD)anim, (DWORD)number}, pos[2] = {*(DWORD *)&time, 0};  // no notifies
+        if (!safe_copy(name, seq[i] + 0xf0, 8) || !safe_copy(&bits, seq[i] + 0xfc, 4) || bits & 0x200)  // SetAnim refuses
+            continue;
+        if (name[0] != args[0] || name[1] != args[1]) safe_call((void *)real_SetAnim, (DWORD)seq[i], args, 2, &ret);
+        if (time >= 0) safe_call(game_va(0x8055b0), (DWORD)seq[i], pos, 2, &ret);
+    }
 }
 
 // ---- Fable engine calls (addresses at Ghidra base, see NOTES.md) ----
@@ -626,11 +645,83 @@ static const DWORD kHpMagic = 0x31484346;  // "FCH1"
 static const DWORD kPlacedIdLimit = 0x10000;
 struct HpEntry { DWORD uid; float dealt; };
 struct NetHp { DWORD magic; int region; int count; HpEntry e[60]; };
-struct EnemyState { DWORD thing; float last; float dealt; float peerApplied; double changed; bool seen; };
+struct EnemyState { DWORD thing; float last; float dealt; float peerApplied; double changed; bool seen; double bodyAt; std::string def; std::string anim; double animChanged; };
 static std::map<DWORD, EnemyState> g_enemies;  // by id (game thread only)
 static std::vector<DWORD> g_creatureScan;      // candidate things from the last scan
 static std::mutex g_creatureScanLock;
-static double g_lastHpSend;
+static double g_lastHpSend, g_lastDeadSend;
+static bool peer_drives(DWORD uid);
+// Enemies dead in either game, by region and id. Each game sends those of its region every second; one that loads
+// alive later is killed: the guest reloaded a checkpoint and met again, at full health, a troll the host had killed
+// meanwhile (owner, 2026-11-03). Killed 3 s after its body appears: right after a load the scan can still hold the
+// freed bodies of the old region. ponytail: for this session only, and a placed creature the game respawns dies
+// again; store it with the save when quests need it.
+static std::set<std::pair<int, DWORD>> g_dead;
+static const DWORD kDeadMagic = 0x31444346;  // "FCD1"
+struct NetDead { DWORD magic; int region; int count; DWORD uid[250]; };
+
+// Summoned creatures (a wood nymph's scorpions) get ids of their own in each game, so the game that summoned one
+// drives it ("native", whoever is near) and tells the peer its definition every second ("FCS1"); the peer creates a
+// creature of that definition (a mirror) and drives it like any copy. A mirror is removed 3 s after the peer stops
+// listing it (unsummoned, dead, or the peer left), or forgotten once the game removed it itself (region unloaded).
+// Ids in packets: a spawned id (>= kPlacedIdLimit) is the sender's own creature as is, or a mirror of the
+// receiver's with 0x80000000 set; the receiver flips that bit (peer_key), since the spawned ids of two games collide.
+// A copy the peer drives summons nothing (hk_Summon): its own AI still ran the summon, so each game had a set of its
+// own in different places (owner, 2026-11-03). Summons go through CTCAISummon 0x1d31f30(pos), creating each creature
+// with the cdecl 0x1f38400 at 0x1d3225c; scorpions carry no CTCSummonedCreature, so that call is what marks them.
+// ponytail: summoned only (generator spawns, villagers too, stay per game); a summoner nobody owns (both heroes
+// over 30 m away) still summons in both games.
+static const DWORD kSpawnMagic = 0x31534346;  // "FCS1"
+struct SpawnEntry { DWORD uid; float v[3]; char def[48]; };
+struct NetSpawn { DWORD magic; int region; int count; SpawnEntry e[16]; };
+struct Mirror { BYTE script[12]; DWORD thing; double heard; };  // script: its CScriptThing, kept for removing it
+static std::map<DWORD, Mirror> g_mirrors;   // by key
+static std::map<DWORD, DWORD> g_mirrorKey;  // mirror thing -> key
+static std::set<DWORD> g_spawnLogged;
+static std::set<DWORD> g_summoned;  // ids created by a summon in this game
+static double g_lastSpawnSend;
+static DWORD peer_key(DWORD id) { return (id & 0x7fffffff) >= kPlacedIdLimit ? id ^ 0x80000000 : id; }
+static DWORD key_of(DWORD thing, DWORD uid)
+{
+    auto m = g_mirrorKey.find(thing);
+    return m != g_mirrorKey.end() ? m->second : uid;
+}
+
+// After AlbionTogether: the component list at CThing +0x44 (begin, end; entries {type, instance}) holds
+// CTCSummonedCreature (type 0x26), live when its bytes +0x10 != 0, +0x12 == 0 and +0x13 == 0 (the hero's spell, untested).
+static bool summoned(DWORD thing, DWORD uid)
+{
+    DWORD range[2], list[2 * 64];
+    BYTE live[4];
+    if (g_summoned.count(uid)) return true;
+    if (!safe_copy(range, (void *)(thing + 0x44), 8) || range[1] <= range[0] || range[1] - range[0] > sizeof list ||
+        !safe_copy(list, (void *)range[0], range[1] - range[0]))
+        return false;
+    for (DWORD i = 0; i < (range[1] - range[0]) / 8; i++)
+        if (list[2 * i] == 0x26) return safe_copy(live, (void *)(list[2 * i + 1] + 0x10), 4) && live[0] && !live[2] && !live[3];
+    return false;
+}
+
+// Definition name ("CREATURE_WOOD_NYMPH_01"), after AlbionTogether: index (u16) at CThing +0x98, definition manager
+// [[0x362f1b0] + 0x2c], 0x16cb160 thiscall(manager; out ref, index), 0x16cabb0 thiscall(ref; out CCharString), text
+// at [string] + 4. "" if a step fails. Checked on the live creatures of region 47 (2026-11-03).
+static std::string def_name(DWORD thing)
+{
+    WORD idx = 0;
+    DWORD mgr = 0, ref = 0, str = 0, text = 0, ret, args[2];
+    char name[64] = "";
+    if (!safe_copy(&idx, (void *)(thing + 0x98), 2) || !idx || !safe_copy(&mgr, game_va(0x362f1b0), 4) || !mgr ||
+        !safe_copy(&mgr, (void *)(mgr + 0x2c), 4) || !mgr)
+        return "";
+    args[0] = (DWORD)&ref, args[1] = idx;
+    if (!safe_call(game_va(0x16cb160), mgr, args, 2, &ret) || !ref) return "";
+    args[0] = (DWORD)&str;
+    if (!safe_call(game_va(0x16cabb0), (DWORD)&ref, args, 1, &ret) || !str) return "";
+    if (safe_copy(&text, (void *)(str + 4), 4) && text) safe_copy(name, (void *)text, sizeof name - 1);
+    safe_call(game_va(0x16b75d0), (DWORD)&str, NULL, 0, &ret);
+    name[sizeof name - 1] = 0;
+    return name;
+}
 
 static Value scan_u32(ULONG_PTR value, size_t limit);
 static void scan_creatures_forever()
@@ -660,7 +751,9 @@ static bool creature_at(DWORD t, DWORD *uid, float hp[2])
 
 static void kill_creature(DWORD t)
 {
-    static BYTE holder[0x40];
+    // 0x1bc03f0 builds the whole CCreatureAction_Die in place (writes up to +0xb4; the game gives it 0xb6+ bytes of
+    // stack). A 0x40-byte static here overwrote ~0x78 bytes of our globals on every kill (p2 hang, 2026-11-03).
+    alignas(8) BYTE holder[0x100];
     DWORD ret, args[2] = {t, 0}, p;
     float zero = 0;
     safe_copy((void *)(t + 0xd0), &zero, 4);
@@ -680,21 +773,41 @@ static void enemies_tick(int here, double now)
     for (DWORD t : scan) {
         DWORD uid;
         float hp[2];
-        if (!creature_at(t, &uid, hp) || uid >= kPlacedIdLimit) continue;
-        auto it = g_enemies.find(uid);
-        if (it == g_enemies.end()) {
-            g_enemies[uid] = {t, hp[1], 0, 0, -1, true};
-            continue;
+        if (!creature_at(t, &uid, hp)) continue;
+        DWORD key = key_of(t, uid);
+        std::string def;
+        if (key == uid && uid >= kPlacedIdLimit && !g_enemies.count(uid)) {  // spawned here: shared if summoned
+            bool sum = summoned(t, uid);
+            if (g_spawnLogged.insert(uid).second || sum)
+                coop_log("creature %lx: %s, %s", (unsigned long)uid, (def = def_name(t)).c_str(), sum ? "summoned, shared" : "not summoned");
+            if (!sum) continue;
         }
+        auto it = g_enemies.find(key);
+        if (it == g_enemies.end()) it = g_enemies.insert({key, {t, hp[1], 0, 0, -1, false, now, def}}).first;
         EnemyState &s = it->second;
         if (s.seen) continue;  // a stale copy of a creature already found this tick
         s.seen = true;
-        if (s.thing != t) { s.thing = t; s.last = hp[1]; continue; }  // reloaded: new body, no change to report
+        if (s.thing != t) s.thing = t, s.last = hp[1], s.bodyAt = now;  // reloaded: new body, no change to report
+        if (here < 0 || key >= kPlacedIdLimit) {  // spawned: dies with its native, never respawns
+        } else if (hp[1] <= 0) {
+            g_dead.insert({here, uid});
+        } else if (g_dead.count({here, uid}) && now - s.bodyAt > 3) {
+            coop_log("enemy %lx: dead in the other game, killed", (unsigned long)uid);
+            kill_creature(t);
+            hp[1] = s.last = 0;  // the peer knows: nothing to report
+        }
         if (hp[1] != s.last) {
             s.dealt += hp[1] - s.last;
             s.last = hp[1];
             s.changed = now;
         }
+    }
+    if (here >= 0 && now - g_lastDeadSend >= 1) {
+        g_lastDeadSend = now;
+        NetDead d = {kDeadMagic, here, 0};
+        for (auto &k : g_dead)
+            if (k.first == here && d.count < (int)_countof(d.uid)) d.uid[d.count++] = k.second;
+        if (d.count) net_send(&d, offsetof(NetDead, uid) + d.count * sizeof(DWORD));
     }
     if (here < 0 || g_peerRegion != here || now - g_lastHpSend < 0.1) return;
     g_lastHpSend = now;
@@ -709,12 +822,13 @@ static void enemies_recv(const NetHp &m, int size, int here)
 {
     if (m.region != here || m.count < 0 || m.count > 60 || size < (int)(offsetof(NetHp, e) + m.count * sizeof(HpEntry))) return;
     for (int i = 0; i < m.count; i++) {
-        auto it = g_enemies.find(m.e[i].uid);
+        auto it = g_enemies.find(peer_key(m.e[i].uid));
         if (it == g_enemies.end()) continue;  // not loaded here
         EnemyState &s = it->second;
         float delta = m.e[i].dealt - s.peerApplied, hp[2];
         DWORD uid;
-        if (delta == 0 || !creature_at(s.thing, &uid, hp) || uid != it->first) continue;
+        if (peer_drives(it->first)) { s.peerApplied = m.e[i].dealt; continue; }  // its health comes with its position
+        if (delta == 0 || !creature_at(s.thing, &uid, hp) || key_of(s.thing, uid) != it->first) continue;
         s.peerApplied = m.e[i].dealt;
         float to = fminf(hp[0], fmaxf(0, hp[1] + delta));
         safe_copy((void *)(s.thing + 0xd0), &to, 4);
@@ -724,43 +838,64 @@ static void enemies_recv(const NetHp &m, int size, int here)
     }
 }
 
+static void dead_recv(const NetDead &m, int size)
+{
+    if (m.count < 0 || m.count > (int)_countof(m.uid) || size < (int)(offsetof(NetDead, uid) + m.count * sizeof(DWORD))) return;
+    for (int i = 0; i < m.count; i++) g_dead.insert({m.region, m.uid[i]});
+}
+
 // ---- enemy movement: the closer player's AI drives, the other game's copy follows ----
 // Free co-op: a troll must wake for the guest even with the host far away (owner, 2026-11-03), so each enemy
-// belongs to the player whose hero came within 30 m first, host or guest (host takes ties and keeps it on a brief
-// double claim), and stays with that player while their hero is within 35 m: the other game's copy never woke (its
-// AI state is spread over the troll's combat states), so a hand-over mid-fight replayed the troll's rise (owner).
-// Nobody that near: each game runs its own copy (a sleeping troll stays asleep in both).
-// Owner: every 0.1 s, position, facing and main anim of each creature it owns ("FCE1", 12 per packet).
+// belongs to the closer hero within 30 m, host or guest (host takes ties and keeps it on a brief double claim). In a
+// fight it stays with that player while their hero is within 35 m: the other game's copy never woke (its AI state is
+// spread over the troll's combat states), so a hand-over mid-fight replayed the troll's rise (owner). Asleep it does
+// not: with the host idling 30 m away, the guest walked up to a troll that woke in their game and stayed buried,
+// forced to the host's sleeping anim, only its red eyes out (owner, 2026-11-04). "In a fight" = its main anim or
+// health changed in the last 5 s. Nobody that near: each game runs its own copy (a sleeping troll stays asleep in both).
+// Owner: every 0.1 s, position, facing, main anim and health of each creature it owns ("FCE2", 11 per packet). Its
+// health is the copy's, downwards only (damage dealt to the copy and not yet applied by the owner stays), and the
+// owner's health deltas ("FCH1") skip the copy: deltas alone left a copy reloaded at full health (500 against the
+// owner's 310) alive at 190 when the owner killed the troll (owner, 2026-11-03).
 // Other side: a creature the peer reports is teleported every frame to the peer's position 0.1 s late (navigator
-// slot 0x90, like the puppet) and plays the peer's anims (SetAnim hook). Its brain still runs: harmless while its
-// own hero is far (the owner is the one near). The brain byte [[brain+0x44]+0x10] the first puppet used is no pause:
-// it marks the current behaviour done, so the brain picked a new one each frame and a troll near the guest's hero
-// started rising 4 times a second (rubble, sound, red eyes). Creature slot 0xc8 (0x1f3b830) is not the per-frame
-// brain update either (hooked, never called for these).
-// ponytail: 30 m guessed from the troll's wake range; an enemy fights only its owner's hero, and a copy near its own
-// hero may still think (both players near one enemy: freeze the brain fibre, target the puppet, next).
-static const DWORD kEnemyPosMagic = 0x31454346;  // "FCE1"
-struct EnemyPos { DWORD uid; float v[5]; char anim[64]; int animNum; };  // creature anim names reach 43 chars
-struct NetEnemyPos { DWORD magic; int region; int count; EnemyPos e[12]; };  // 1116 bytes, under 1200
-struct Driven { std::deque<PuppetSample> s; std::string animName; int anim = -1, animNum = 0; double lastRecv = 0; DWORD thing = 0; BYTE *skel = nullptr; };
+// slot 0x90, like the puppet) and plays the peer's anims at the peer's anim time (force_anim). Its own AI runs: a
+// brain freeze after AlbionTogether (CAIBrain vftable 0x2eaf388 slot 4 = 0x1ad7700, and the state-group dispatcher
+// 0x1f3b800 into arbitration 0x1ad7f20) kept each copy in its own state: a sleeping troll never woke, so its host
+// could not hit it, and after a reload only its red eyes showed (owner, 2026-11-03). Freeze again once the owner's
+// AI state is sent. The brain byte
+// [[brain+0x44]+0x10] the first puppet used is no pause: it marks the current behaviour done, so the brain picked a
+// new one each frame and a troll near the guest's hero started rising 4 times a second (rubble, sound, red eyes).
+// Creature slot 0xc8 (0x1f3b830) is not the per-frame brain update either (hooked, never called for these).
+// ponytail: 30 m guessed from the troll's wake range; an enemy fights only its owner's hero (the other player's
+// puppet is no target): target the puppet and relay its hits, next.
+static const DWORD kEnemyPosMagic = 0x32454346;  // "FCE2"
+struct EnemyPos { DWORD uid; float v[5]; char anim[64]; int animNum; float animTime, hp; };  // anim names reach 43 chars
+struct NetEnemyPos { DWORD magic; int region; int count; EnemyPos e[11]; };  // 1112 bytes, under 1200
+struct Driven {
+    std::deque<PuppetSample> s;
+    std::string animName;
+    int anim = -1, animNum = 0;
+    float animTime = 0;  // the owner's, at animAt
+    double lastRecv = 0, animAt = 0;
+    DWORD thing = 0;
+    BYTE *skel = nullptr;
+};
 static std::map<DWORD, Driven> g_driven;  // driven by the peer, by id
+static bool peer_drives(DWORD uid) { return g_driven.count(uid) != 0; }
 static std::set<DWORD> g_owned;           // ours, sent to the peer
-// Anim name -> GNames index (ponytail: cached for good, names only grow). File scope on purpose: as a function-local
-// static its thread-safe init guard stayed "in progress" and the game thread waited on it for good (p2 hung at the
-// first anim name from the peer, 2026-11-03; cause of the stuck guard not found).
+// Anim name -> GNames index (ponytail: cached for good, names only grow).
 static std::map<std::string, int> g_animIds;
 static float g_heroPos[3], g_peerPos[3];  // this region only
 static double g_lastPosSend;
 
 // Whether this game's hero is the closer one to the enemy at `pos`, per the rule above.
-static bool closer_here(DWORD uid, const float *pos)
+static bool closer_here(DWORD uid, const float *pos, bool fighting)
 {
     auto d2 = [&](const float *a) { float x = a[0] - pos[0], y = a[1] - pos[1], z = a[2] - pos[2]; return sqrtf(x * x + y * y + z * z); };
-    float mine = d2(g_heroPos), lead = d2(g_peerPos) - mine;
+    float mine = d2(g_heroPos), theirs = d2(g_peerPos), lead = theirs - mine;
     bool kept = g_owned.count(uid) != 0;
     if (mine > (kept ? 35.f : 30.f)) return false;  // nobody near: each game's own AI (a troll sleeps; paused, it never does)
-    if (kept) return true;  // the other game's copy never woke: handing over mid-fight made the troll rise again (owner)
-    return lead > (g_host ? -1.5f : 1.5f);  // host takes ties: an enemy never goes ownerless
+    if (kept && fighting) return true;  // the other game's copy never woke: handing over mid-fight made the troll rise again (owner)
+    return theirs > 30 || lead > (g_host ? -1.5f : 1.5f);  // host takes ties: an enemy never goes ownerless
 }
 
 
@@ -775,37 +910,47 @@ static void enemies_send_positions(int here, double now)
         m.count = 0;
     };
     for (auto &e : g_enemies) {
-        if (!e.second.seen) continue;
+        if (!e.second.seen || e.first & 0x80000000) continue;  // a mirror: the peer's
         float *phys = nullptr;
         EnemyPos &p = m.e[m.count];
         if (g_driven.count(e.first) || !safe_copy(&phys, (void *)(e.second.thing + 0x6c), 4) || !phys ||
-            !safe_copy(p.v, phys + 0x0c / 4, 12) || !safe_copy(p.v + 3, phys + 0x5c / 4, 8))
+            !safe_copy(p.v, phys + 0x0c / 4, 12) || !safe_copy(p.v + 3, phys + 0x5c / 4, 8) ||
+            !safe_copy(&p.hp, (void *)(e.second.thing + 0xd0), 4))
             continue;
-        if (!closer_here(e.first, p.v)) { g_owned.erase(e.first); continue; }
+        EnemyState &s = e.second;
+        bool fighting = (s.animChanged > 0 && now - s.animChanged < 5) || (s.changed >= 0 && now - s.changed < 5);
+        if (e.first < kPlacedIdLimit && !closer_here(e.first, p.v, fighting)) { g_owned.erase(e.first); continue; }  // summoned: always ours
         g_owned.insert(e.first);
         p.uid = e.first;
-        main_anim(skel_of(e.second.thing), p.anim, sizeof p.anim, &p.animNum);
-        if (++m.count == 12) flush();
+        main_anim(skel_of(s.thing), p.anim, sizeof p.anim, &p.animNum, &p.animTime);
+        if (s.anim != p.anim) {
+            if (!s.anim.empty()) s.animChanged = now;
+            s.anim = p.anim;
+        }
+        if (++m.count == (int)_countof(m.e)) flush();
     }
     flush();
 }
 
 static void enemies_pos_recv(const NetEnemyPos &m, int size, int here, double now)
 {
-    if (m.region != here || m.count < 0 || m.count > 12 || size < (int)(offsetof(NetEnemyPos, e) + m.count * sizeof(EnemyPos))) return;
+    if (m.region != here || m.count < 0 || m.count > (int)_countof(m.e) ||
+        size < (int)(offsetof(NetEnemyPos, e) + m.count * sizeof(EnemyPos)))
+        return;
     for (int i = 0; i < m.count; i++) {
         const EnemyPos &p = m.e[i];
-        auto it = g_enemies.find(p.uid);
+        DWORD key = peer_key(p.uid);
+        auto it = g_enemies.find(key);
         if (it == g_enemies.end() || !it->second.seen) continue;  // not loaded here
-        if (g_owned.count(p.uid)) {
+        if (g_owned.count(key)) {
             if (g_host) continue;  // both claimed it for a moment (lag): the host keeps it
-            g_owned.erase(p.uid);
+            g_owned.erase(key);
         }
-        Driven &d = g_driven[p.uid];
+        Driven &d = g_driven[key];
         if (d.thing != it->second.thing) {
             d.thing = it->second.thing;
             d.s.clear();
-            coop_log("enemy %lx: driven by the peer", (unsigned long)p.uid);
+            coop_log("enemy %lx: driven by the peer", (unsigned long)key);
         }
         d.lastRecv = now;
         PuppetSample smp = {now};
@@ -823,6 +968,16 @@ static void enemies_pos_recv(const NetEnemyPos &m, int size, int here, double no
             d.anim = id;
         }
         d.animNum = p.animNum;
+        d.animTime = p.animTime;
+        d.animAt = now;
+        float hp[2];
+        DWORD uid;
+        if (creature_at(d.thing, &uid, hp) && key_of(d.thing, uid) == key && p.hp < hp[1]) {
+            coop_log("enemy %lx: peer's health %.0f -> %.0f", (unsigned long)key, hp[1], p.hp);
+            if (p.hp <= 0) kill_creature(d.thing);
+            else safe_copy((void *)(d.thing + 0xd0), &p.hp, 4);
+            it->second.last = fmaxf(p.hp, 0);
+        }
     }
 }
 
@@ -832,7 +987,7 @@ static void enemies_drive(double now)
         Driven &d = it->second;
         DWORD uid;
         float hp[2];
-        bool alive = creature_at(d.thing, &uid, hp) && uid == it->first;
+        bool alive = creature_at(d.thing, &uid, hp) && key_of(d.thing, uid) == it->first;
         if (d.skel) g_drivenSkel.erase(d.skel);
         if (!alive || now - d.lastRecv > 0.5) {
             if (alive) coop_log("enemy %lx: peer stopped, own AI back", (unsigned long)it->first);
@@ -846,16 +1001,229 @@ static void enemies_drive(double now)
         }
         d.skel = skel_of(d.thing);
         if (d.skel) g_drivenSkel[d.skel] = {d.anim, d.animNum};
-        if (d.skel && d.anim >= 0) {
-            BYTE *seq[64];
-            for (int i = 0, n = anim_sequences(d.skel, seq, 64); i < n; i++) {
-                DWORD name[2], ret, args[2] = {(DWORD)d.anim, (DWORD)d.animNum};
-                if (safe_copy(name, seq[i] + 0xf0, 8) && (name[0] != args[0] || name[1] != args[1]))
-                    safe_call((void *)real_SetAnim, (DWORD)seq[i], args, 2, &ret);
-            }
+        // ponytail: the owner's last anim time run on at rate 1, 0.1 s ahead of the position; send the rate if it shows.
+        if (d.skel && d.anim >= 0) force_anim(d.skel, d.anim, d.animNum, d.animTime + (float)(std::min)(now - d.animAt, 0.2));
+        ++it;
+    }
+}
+
+// Mirrors upkeep, then this game's live summoned creatures to the peer (once a second, same region only).
+static void mirrors_tick(int here, double now)
+{
+    for (auto it = g_mirrors.begin(); it != g_mirrors.end();) {
+        Mirror &m = it->second;
+        if (m.thing && thing_of(*(DWORD *)(m.script + 4) + 0xc) != m.thing) g_mirrorKey.erase(m.thing), m.thing = 0;  // removed by the game
+        if (now - m.heard <= 3) { ++it; continue; }
+        DWORD gsi = *(DWORD *)game_va(kGsiGlobal), ret, args[3] = {(DWORD)m.script, 0, 1};
+        if (m.thing) safe_call(game_va(0x1c8ec40), gsi, args, 3, &ret), g_mirrorKey.erase(m.thing);
+        coop_log("mirror %lx: removed", (unsigned long)it->first);
+        it = g_mirrors.erase(it);
+    }
+    if (here < 0 || g_peerRegion != here || now - g_lastSpawnSend < 1) return;
+    g_lastSpawnSend = now;
+    NetSpawn s = {kSpawnMagic, here, 0};
+    for (auto &e : g_enemies) {
+        float *phys = nullptr;
+        SpawnEntry &x = s.e[s.count];
+        if (e.second.def.empty() || !e.second.seen || e.second.last <= 0 || !summoned(e.second.thing, e.first) ||
+            !safe_copy(&phys, (void *)(e.second.thing + 0x6c), 4) || !phys || !safe_copy(x.v, phys + 0x0c / 4, 12))
+            continue;
+        x.uid = e.first;
+        strncpy_s(x.def, e.second.def.c_str(), _TRUNCATE);
+        if (++s.count == (int)_countof(s.e)) break;  // ponytail: 16 summoned at once
+    }
+    if (s.count) net_send(&s, offsetof(NetSpawn, e) + s.count * sizeof(SpawnEntry));
+}
+
+static void spawn_recv(const NetSpawn &m, int size, int here, double now)
+{
+    if (m.region != here || m.count < 0 || m.count > (int)_countof(m.e) ||
+        size < (int)(offsetof(NetSpawn, e) + m.count * sizeof(SpawnEntry)))
+        return;
+    for (int i = 0; i < m.count; i++) {
+        DWORD key = peer_key(m.e[i].uid);
+        auto it = g_mirrors.find(key);
+        if (it != g_mirrors.end()) { it->second.heard = now; continue; }
+        if (!(key & 0x80000000) || g_mirrors.size() >= 32) continue;
+        char def[sizeof m.e[i].def];
+        strncpy_s(def, m.e[i].def, _TRUNCATE);
+        Mirror &mi = g_mirrors[key];  // kept even when the spawn fails: no retry every second
+        mi.heard = now;
+        try {
+            spawn_creature(def, m.e[i].v, false);
+            memcpy(mi.script, g_puppet, sizeof mi.script);
+            memcpy(g_puppet, g_puppetScript, sizeof g_puppetScript);  // g_puppet stays the puppet's
+            mi.thing = thing_of(*(DWORD *)(mi.script + 4) + 0xc);
+        } catch (const std::exception &e) {
+            coop_log("mirror %lx: %s spawn failed: %s", (unsigned long)key, def, e.what());
+            continue;
+        }
+        coop_log("mirror %lx: %s spawned, thing %08lx", (unsigned long)key, def, (unsigned long)mi.thing);
+        if (!mi.thing) continue;
+        g_mirrorKey[mi.thing] = key;
+        std::lock_guard<std::mutex> lk(g_creatureScanLock);
+        g_creatureScan.push_back(mi.thing);  // found by enemies_tick before the next scan
+    }
+}
+
+// ---- thrown rocks ----
+// A troll's rock exists only where its AI runs: the copy shows the throw, no rock (owner, 2026-11-03). CCreatureAction_
+// TrollThrowProjectile (vftable 0x2ecbe7c, slot 12 = 0x1bc3350) creates it at 0x1bc3449 with the cdecl 0x1f58490(def
+// index, position, thing +0x9c, 1, 0, 0, name ""), a CThingObject (OBJECT_ROCK_TROLL_ROCK, its def index 0x4a8), carries
+// it and fires it. The game that created one sends it every 0.05 s ("FCT1"); the peer creates the same object and
+// moves it each frame 0.1 s late, by physics slot 0x10 with a matrix from 0x1be0cf0 (it would fall otherwise), then
+// removes it (0x1f2e530(thing, 0)) 0.3 s after the last packet. All tried on a live game (2026-11-03).
+// A thing handle (ctor 0x16e6e90, set 0x16e6ee0, dtor 0x16e6f60) reads 0 once the game destroyed the thing.
+// ponytail: position only: no spin, no impact effect, no damage on the peer's side; a copy whose own AI throws gives
+// a second rock.
+static const DWORD kThrownMagic = 0x31544346;  // "FCT1"
+struct ThrownPos { DWORD id; DWORD def; float v[3]; };
+struct NetThrown { DWORD magic; int region; int count; ThrownPos e[8]; };
+struct ThrownOut { BYTE handle[8]; DWORD id, def; double born; };
+struct ThrownIn { BYTE handle[8]; std::deque<PuppetSample> s; double heard; };
+static std::vector<ThrownOut> g_thrownOut;
+static std::map<DWORD, ThrownIn> g_thrownIn;  // by the peer's id
+static double g_lastThrownSend;
+
+static void handle_set(BYTE *h, DWORD thing)
+{
+    DWORD ret;
+    safe_call(game_va(0x16e6e90), (DWORD)h, NULL, 0, &ret);
+    safe_call(game_va(0x16e6ee0), (DWORD)h, &thing, 1, &ret);
+}
+static void handle_free(BYTE *h)
+{
+    DWORD ret;
+    safe_call(game_va(0x16e6f60), (DWORD)h, NULL, 0, &ret);
+}
+
+static DWORD __cdecl hk_RockCreate(DWORD def, DWORD pos, DWORD layer, DWORD a, DWORD b, DWORD c, DWORD name)
+{
+    DWORD t = ((DWORD(__cdecl *)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD))game_va(0x1f58490))(def, pos, layer, a, b, c, name), id;
+    if (t && safe_copy(&id, (void *)(t + 0x14), 4)) {
+        ThrownOut o = {{}, id, def, now_s()};
+        handle_set(o.handle, t);
+        g_thrownOut.push_back(o);
+        coop_log("rock %lx thrown, def %lx", (unsigned long)id, (unsigned long)def);
+    }
+    return t;
+}
+
+static void thrown_send(int here, double now)
+{
+    if (now - g_lastThrownSend < 0.05) return;
+    g_lastThrownSend = now;
+    NetThrown m = {kThrownMagic, here, 0};
+    for (auto it = g_thrownOut.begin(); it != g_thrownOut.end();) {
+        DWORD t = thing_of((DWORD)it->handle), pos;
+        if (!t || now - it->born > 15) {  // ponytail: a rock left lying goes from the peer's game after 15 s
+            handle_free(it->handle);
+            it = g_thrownOut.erase(it);
+            continue;
+        }
+        ThrownPos &x = m.e[m.count];
+        if (m.count < (int)_countof(m.e) && safe_call(game_va(0x1f2b440), t, NULL, 0, &pos) && safe_copy(x.v, (void *)pos, 12)) {
+            x.id = it->id, x.def = it->def;
+            m.count++;
         }
         ++it;
     }
+    if (m.count && here >= 0 && g_peerRegion == here) net_send(&m, offsetof(NetThrown, e) + m.count * sizeof(ThrownPos));
+}
+
+static DWORD create_rock(DWORD def, const float *pos)
+{
+    auto ctor = (CharStringCtor)game_va(0x16b7800);
+    auto dtor = (CharStringDtor)game_va(0x16b75d0);
+    void *name = 0;
+    BYTE layer = 0;
+    DWORD hero = hero_thing(), t = 0;
+    safe_copy(&layer, (void *)(hero + 0x9c), 1);
+    ctor(&name, "", -1);
+    DWORD args[7] = {def, (DWORD)pos, layer, 1, 0, 0, (DWORD)&name};
+    if (!safe_call(game_va(0x1f58490), 0, args, 7, &t)) t = 0;
+    dtor(&name);
+    return t;
+}
+
+static void thrown_recv(const NetThrown &m, int size, int here, double now)
+{
+    if (m.region != here || m.count < 0 || m.count > (int)_countof(m.e) ||
+        size < (int)(offsetof(NetThrown, e) + m.count * sizeof(ThrownPos)))
+        return;
+    for (int i = 0; i < m.count; i++) {
+        const ThrownPos &x = m.e[i];
+        auto it = g_thrownIn.find(x.id);
+        if (it == g_thrownIn.end()) {
+            if (g_thrownIn.size() >= 8) continue;
+            DWORD t = create_rock(x.def, x.v);
+            coop_log("rock %lx from the peer: def %lx, thing %08lx", (unsigned long)x.id, (unsigned long)x.def, (unsigned long)t);
+            it = g_thrownIn.insert({x.id, {}}).first;
+            if (t) handle_set(it->second.handle, t);  // else its handle stays 0: dropped at once, no retry until it ends
+        }
+        ThrownIn &r = it->second;
+        r.heard = now;
+        PuppetSample smp = {now};
+        memcpy(smp.v, x.v, sizeof x.v);
+        r.s.push_back(smp);
+        while (r.s.size() > 20) r.s.pop_front();
+    }
+}
+
+static void thrown_drive(double now)
+{
+    static const float dirs[6] = {0, 0, 1, 0, 1, 0};  // as 0x1f58490 places a thing with no direction given
+    for (auto it = g_thrownIn.begin(); it != g_thrownIn.end();) {
+        ThrownIn &r = it->second;
+        DWORD t = thing_of((DWORD)r.handle), ret, zero = 0, phys = 0, vft = 0, slot = 0;
+        if (t && now - r.heard <= 0.3) {
+            float v[5];
+            alignas(8) BYTE matrix[0x40];
+            sample_at(r.s, now - 0.1, v);
+            DWORD args[2] = {(DWORD)v, (DWORD)dirs}, m = (DWORD)matrix;
+            if (safe_copy(&phys, (void *)(t + 0x6c), 4) && phys && safe_copy(&vft, (void *)phys, 4) && safe_copy(&slot, (void *)(vft + 0x10), 4) &&
+                safe_call(game_va(0x1be0cf0), m, args, 2, &ret))
+                safe_call((void *)slot, phys, &m, 1, &ret);
+            ++it;
+            continue;
+        }
+        if (now - r.heard <= 0.3) { ++it; continue; }  // destroyed here or never created: wait for the peer's to end
+        if (t) safe_call(game_va(0x1f2e530), t, &zero, 1, &ret);
+        handle_free(r.handle);
+        it = g_thrownIn.erase(it);
+    }
+}
+
+static int __fastcall hk_Summon(DWORD comp, DWORD, float *pos)
+{
+    DWORD owner = 0, uid;
+    float hp[2];
+    if (safe_copy(&owner, (void *)(comp + 4), 4) && creature_at(owner, &uid, hp) && peer_drives(key_of(owner, uid))) {
+        coop_log("enemy %lx: summon skipped, the peer drives it", (unsigned long)uid);
+        return 0;
+    }
+    return ((int(__fastcall *)(DWORD, DWORD, float *))game_va(0x1d31f30))(comp, 0, pos);
+}
+
+static DWORD __cdecl hk_SummonCreate(DWORD a, DWORD b, DWORD c, DWORD d)
+{
+    DWORD t = ((DWORD(__cdecl *)(DWORD, DWORD, DWORD, DWORD))game_va(0x1f38400))(a, b, c, d), uid;
+    if (t && safe_copy(&uid, (void *)(t + 0x14), 4)) {
+        g_summoned.insert(uid);
+        g_lastSpawnSend = 0;  // the peer's mirror should rise with it
+        std::lock_guard<std::mutex> lk(g_creatureScanLock);
+        g_creatureScan.push_back(t);
+    }
+    return t;
+}
+
+// Points a `call target` at `site` to hook; false if the call is not there (another build of the exe).
+static bool hook_call(ULONG_PTR site, ULONG_PTR target, void *hook)
+{
+    BYTE expect[5] = {0xe8}, with[5] = {0xe8};
+    *(DWORD *)(expect + 1) = (DWORD)(target - site - 5);
+    *(DWORD *)(with + 1) = (DWORD)hook - (DWORD)game_va(site) - 5;
+    return patch_code(site, (const char *)expect, (const char *)with, 5);
 }
 
 static void net_init()
@@ -914,13 +1282,21 @@ static void net_tick(Puppet &pp)
         safe_copy(g_heroPos, hero + 0x0c / 4, 12);
         enemies_tick(here, now);
         enemies_send_positions(here, now);
+        mirrors_tick(here, now);
+        thrown_send(here, now);
     }
-    union { NetPos pos; NetHp hp; NetEnemyPos epos; DWORD magic; } pkt;
+    union { NetPos pos; NetHp hp; NetEnemyPos epos; NetDead dead; NetSpawn spawn; NetThrown thrown; DWORD magic; } pkt;
     NetPos &m = pkt.pos;
     bool got = false;
     for (int size; (size = net_recv(&pkt, sizeof pkt));)
         if (pkt.magic == kHpMagic) {
             if (hero) enemies_recv(pkt.hp, size, here);
+        } else if (pkt.magic == kDeadMagic) {
+            dead_recv(pkt.dead, size);
+        } else if (pkt.magic == kSpawnMagic) {
+            if (hero) spawn_recv(pkt.spawn, size, here, now);
+        } else if (pkt.magic == kThrownMagic) {
+            if (hero) thrown_recv(pkt.thrown, size, here, now);
         } else if (pkt.magic == kEnemyPosMagic) {
             if (hero) enemies_pos_recv(pkt.epos, size, here, now);
         } else if (pkt.magic == kNetMagic && size == sizeof m) {
@@ -950,17 +1326,10 @@ static void net_tick(Puppet &pp)
             if (pp.samples.size() > 200) pp.samples.pop_front();  // not driven (no puppet): keep it bounded
             got = true;
         }
-    if (hero) enemies_drive(now);
+    if (hero) enemies_drive(now), thrown_drive(now);
     DWORD thing = pp.actor ? thing_of(pp.actor + 0x14) : 0;
     g_puppetSkel = skel_of(thing);
-    if (g_puppetSkel && g_peerAnim >= 0) {  // the game sets anims only on change: put the remote one on every node
-        BYTE *seq[64];
-        for (int i = 0, n = anim_sequences(g_puppetSkel, seq, 64); i < n; i++) {
-            DWORD name[2], ret, args[2] = {(DWORD)g_peerAnim, (DWORD)g_peerAnimNum};
-            if (safe_copy(name, seq[i] + 0xf0, 8) && (name[0] != args[0] || name[1] != args[1]))
-                safe_call((void *)real_SetAnim, (DWORD)seq[i], args, 2, &ret);
-        }
-    }
+    if (g_puppetSkel && g_peerAnim >= 0) force_anim(g_puppetSkel, g_peerAnim, g_peerAnimNum);
     if (pp.actor && !thing) {  // the game removed it (region load): stop touching its old body
         coop_log("net: puppet gone");
         pp.actor = 0;
@@ -984,6 +1353,11 @@ static void net_tick(Puppet &pp)
         pp.actor = begin_scripting(gsi, g_puppet);
         thing = pp.actor ? thing_of(pp.actor + 0x14) : 0;
         if (!thing || !safe_copy(&pp.phys, (void *)(thing + 0x6c), 4)) throw std::runtime_error("no puppet body");
+        // Takes no damage and cannot die (0x1f59cb0 reads +0xd8 bit 0 "damageable", bit 1 "killable"): next to a
+        // troll this game ran, it went and came back every 9 s, killed most likely (2026-11-03).
+        // ponytail: its hits are lost; relay them to the other player's hero with enemy targeting.
+        BYTE flags;
+        if (safe_copy(&flags, (void *)(thing + 0xd8), 1)) flags &= ~3, safe_copy((void *)(thing + 0xd8), &flags, 1);
         pp.delay = 0.1;  // ponytail: fixed jitter buffer, measure real jitter over Steam
         coop_log("net: puppet spawned, actor %08lx physics %p", (unsigned long)pp.actor, pp.phys);
     } catch (const std::exception &e) {
@@ -1397,6 +1771,10 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         coop_log("run in background patch: %s", bg ? "on" : "FAILED (unknown exe build)");
         bool hookAnim = ((void **)game_va(kAnimNodeSequenceVft))[kSetAnimSlot] == game_va(kSetAnim);
         if (hookAnim) hook_vftable_slot(kAnimNodeSequenceVft, kSetAnimSlot, (void *)hk_SetAnim, (void **)&real_SetAnim);
+        bool summon = hook_call(0x1b9d719, 0x1d31f30, (void *)hk_Summon) && hook_call(0x1c0f0de, 0x1d31f30, (void *)hk_Summon) &&
+                      hook_call(0x1d3225c, 0x1f38400, (void *)hk_SummonCreate);
+        coop_log("summon hooks: %s", summon ? "on" : "off (unknown exe)");
+        coop_log("rock hook: %s", hook_call(0x1bc3449, 0x1f58490, (void *)hk_RockCreate) ? "on" : "off (unknown exe)");
         coop_log("puppet hero-anim hook: %s", hookAnim ? "on" : "FAILED (unknown exe build)");
         hook_vftable_slot(kGsiVftable, kGsiSetCompleted, (void *)hk_SetCompleted, (void **)&real_SetCompleted);
         if (GetEnvironmentVariableA("FABLE_COOP_TRACE_GSI", NULL, 0)) trace_gsi_init();
