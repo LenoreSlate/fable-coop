@@ -10,10 +10,14 @@ test log are in [games/fable-anniversary](https://github.com/cranebeaker/coop-an
 
 - Each copy shows the other player's hero as a puppet in the same region: position, facing, animations.
 - The guest follows the host's time of day.
+- Enemies placed in the world (not yet those spawned by generators): health and death are shared both ways, and each
+  enemy is run by the game of the player who came within 30 m of it first while the other game mirrors its position
+  and animations. Tested with one player near an enemy (a stone troll wakes for the guest with the host far away);
+  with both players near the same enemy it still fights only its owner's hero.
 - Several copies run side by side, keep running in the background, and save into their own profile folder
   (never the player's real save or Steam Cloud).
 
-Not shared yet: enemies, quests, items, money. Transport: local UDP, or the Steam relay through the game's own
+Not shared yet: quests, items, money. Transport: local UDP, or the Steam relay through the game's own
 `steam_api.dll` (both players need to own the game; checked so far only by a one-account loopback test).
 
 ## Play with a friend (Steam)
@@ -51,7 +55,7 @@ Use a **copy** of the game folder, never your Steam install. Put `proxy\build\di
 | `FABLE_COOP_PROFILE` | `p1` | Save folder: `<game dir>\CoopProfiles\<profile>` (log: `fable_coop.log` there) |
 | `FABLE_COOP_LISTEN` | `27960` | Local UDP port |
 | `FABLE_COOP_PEER` | `127.0.0.1:27961` | The other copy over UDP (needs `FABLE_COOP_LISTEN`), or `steam:<SteamID64>` for the other player over Steam (`steam:me`: loopback self-test) |
-| `FABLE_COOP_HOST` | `1` | Set on one copy only: its time of day wins |
+| `FABLE_COOP_HOST` | `1` | Set on one copy only: its time of day wins, and it keeps an enemy both claim at once |
 
 ## Tools
 
